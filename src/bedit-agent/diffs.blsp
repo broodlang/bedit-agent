@@ -1,0 +1,51 @@
+;; Diffs as the agent's work shows them: the lines a change took out and put in (`diff-lines`,
+;; for the transcript and a proposed change) and a unified diff shown beside you in its colours
+;; (`show-diff`, what `show_changes` and `show_diff` open).
+
+(defmodule bedit-agent/diffs
+  "Diff lines and unified diffs, coloured with theme roles and shown beside you."
+  (:use pool :only [ed-display-buffer]))
+
+(defn diff-lines (old new)
+  "The lines a change of `old` to `new` took out and put in, as `[text face]` pairs — what the
+transcript shows under an edit and a proposed change shows before you allow it.
+
+    (bedit-agent/diffs/diff-lines \"a\" \"b\")   ;=> [[\"- a\" :syntax/error] [\"+ b\" :syntax/string]]"
+  (into (vec (map (string/split old "\n") (fn (line) [(str "- " line) :syntax/error])))
+    (map (string/split new "\n") (fn (line) [(str "+ " line) :syntax/string]))))
+
+(defn- line-face (line)
+  (cond
+    (or (string/starts-with? line "+++") (string/starts-with? line "---")) :syntax/comment
+    (string/starts-with? line "@@") :syntax/keyword
+    (string/starts-with? line "+") :syntax/string
+    (string/starts-with? line "-") :syntax/error
+    else nil))
+
+(defn unified-lines (text)
+  "Unified diff `text` as `[text face]` lines, each coloured as [[diff-spans]] colours it.
+
+    (bedit-agent/diffs/unified-lines \"@@ -1 +1 @@\\n-a\")   ;=> [[\"@@ -1 +1 @@\" :syntax/keyword] [\"-a\" :syntax/error]]"
+  (vec (map (string/split (string/trimr text) "\n") (fn (line) [line (line-face line)]))))
+
+(defn diff-spans (text)
+  "The faces of unified diff `text`, line by line: a hunk header, a removed line, an added line,
+the file names.
+
+    (bedit-agent/diffs/diff-spans \"@@ -1 +1 @@\\n-a\\n+b\")   ;=> [[0 11 :syntax/keyword] [12 14 :syntax/error] [15 17 :syntax/string]]"
+  (first (fold (string/split text "\n")
+           [[] 0]
+           (fn (progress line)
+             (let ([spans at] progress
+                   end (+ at (string/length line))
+                   face (line-face line))
+               [(if face (conj spans [at end face]) spans) (inc end)])))))
+
+(defn show-diff (m title text)
+  "`m` with unified diff `text` shown beside you as `*agent: TITLE*`, coloured, the selection
+left put."
+  (ed-display-buffer m
+    (str "*agent: " title "*")
+    text
+    nil
+    {:action :display :spans (diff-spans text)}))

@@ -1,0 +1,88 @@
+;; What bedit-agent keeps PER PROJECT, in bedit's own state (`state/agent-projects.blsp`,
+;; project root -> entry), never in the project's committed files — each of these is personal:
+;;
+;;   :config-dir  the Claude account its sessions run as (a path, or `:inherit`: bedit's own)
+;;   :trusted     whether its `.bedit-agent.blsp` may widen what an agent does
+;;   :sessions    its past chat sessions, newest first — `{:claude-session :profile :title
+;;                :at :config-dir}` — what `M-x agent-resume` offers
+;;
+;; Which account a session gets: the project's saved choice, else the profile's `:config-dir`,
+;; else whatever bedit was started with (its `CLAUDE_CONFIG_DIR`, else `~/.claude`).
+
+(defmodule bedit-agent/project-state
+  "Per-project state, personal and kept in bedit's state: the Claude account (`saved-dir`,
+`save-dir`, `config-dir-for`), trust (`trusted?`, `set-trusted`) and past sessions
+(`remember-session`, `past-sessions`)."
+  (:use projects :only [editor-state-dir persist-read-value persist-write!]))
+
+;; Where the per-project state is kept; a test binds its own.
+(defdyn bedit-agent/project-state/*state-file* nil)
+
+(defn state-file ()
+  "The file holding each project's state."
+  (or bedit-agent/project-state/*state-file* (path/join (editor-state-dir) "agent-projects.blsp")))
+
+(defn saved (root)
+  "What is saved for project `root`: `{:config-dir …}`, or nil."
+  (let (all (persist-read-value (state-file) {}))
+    (if (map? all) (get all root) nil)))
+
+(defn saved-dir (root)
+  "The Claude config directory saved for project `root`: a path, `:inherit` (bedit's own,
+chosen), or nil when nothing was chosen."
+  (:config-dir (saved root)))
+
+(defn- save-field (root key value)
+  ;; project `root`'s `key` set to `value` (nil removes it) in the state file
+  (let (all (persist-read-value (state-file) {})
+        current (if (map? all) all {})
+        entry (if (nil? value)
+                (dissoc (or (get current root) {}) key)
+                (assoc (or (get current root) {}) key value)))
+    (persist-write! (state-file)
+      (if (empty? entry) (dissoc current root) (assoc current root entry))
+      ";; bedit-agent: per project, the Claude account its sessions run as (M-x agent-account)
+;; and whether its .bedit-agent.blsp is trusted (M-x agent-trust-project)")
+    value))
+
+(defn save-dir (root dir)
+  "Save `dir` as project `root`'s Claude config directory: a path, or `:inherit` for bedit's
+own; nil forgets the choice. Answers `dir`."
+  (save-field root :config-dir dir))
+
+(defn trusted? (root)
+  "Whether you have trusted project `root`'s `.bedit-agent.blsp` to widen what its agents may
+do (`profiles/widening-keys`)."
+  (= true (:trusted (saved root))))
+
+(defn set-trusted (root trusted)
+  "Trust project `root`'s profiles, or stop. Answers `trusted`."
+  (do (save-field root :trusted (if trusted true nil)) trusted))
+
+(defn config-dir-for (root profile)
+  "The Claude config directory a session of `profile` in `root` runs with: the project's
+saved one (`:inherit`: bedit's own), else the profile's `:config-dir` (`~` expanded), else nil —
+bedit's own.
+
+    (bedit-agent/project-state/config-dir-for \"/no/such/root\" {:config-dir \"/x\"})   ;=> \"/x\""
+  (let (chosen (saved-dir root))
+    (cond
+      (string? chosen) chosen
+      (= chosen :inherit) nil
+      (:config-dir profile) (path/absolute (:config-dir profile) root)
+      else nil)))
+
+;; How many past sessions a project keeps.
+(def sessions-kept 30)
+
+(defn past-sessions (root)
+  "Project `root`'s past chat sessions, newest first."
+  (or (:sessions (saved root)) []))
+
+(defn remember-session (root entry)
+  "Keep chat session `entry` (`{:claude-session :profile :title :at :config-dir}`) as project
+`root`'s newest, replacing an older record of the same Claude session. Answers `entry`."
+  (let (others (seq/reject (past-sessions root)
+                 (fn (past) (= (:claude-session past) (:claude-session entry)))))
+    (save-field root :sessions (vec (take (cons entry others) sessions-kept)))
+    entry))

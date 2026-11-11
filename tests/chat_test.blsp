@@ -1,0 +1,129 @@
+(defmodule chat-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat)
+  (:use bedit-agent/transcript))
+
+(defn ct-model ()
+  "A model with a chat session whose worker is this test process."
+  (let (s {:id "a1"
+           :root "/tmp/proj"
+           :profile {:name "dev"}
+           :frontend :chat
+           :worker (self)
+           :buffer "*agent: proj/dev*"
+           :busy false})
+    (open-chat (put-session (ed-init (make-buffer "")) s) s)))
+
+(defn ct-text (m) (buffer-text (ed-current-buf m)))
+
+(defn ct-event (m kind payload) (ed-ev-agent m [:agent (self) kind payload] nil 80 24))
+
+(describe "the chat transcript"
+  (test "a session opens with the prompt last"
+    (let (m (ct-model))
+      (is (string/ends-with? (ct-text m) "❯ "))
+      (assert= (:input-start (ed-current-buf m)) (string/length (ct-text m)))))
+  (test "streamed text and tool calls land above the prompt, what you typed stays"
+    (let (typed (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "half a thought"))
+          m (-> typed
+              (ct-event :ready {:model "opus" :auth "none"})
+              (ct-event :text-delta "Hel")
+              (ct-event :text-delta "lo.")
+              (ct-event :text "Hello.")
+              (ct-event :tool-use {:id "t" :name "mcp__bedit__bash" :input {:command "nest test"}})
+              (ct-event :tool-result {:id "t" :output "3 passed\nmore" :error? false})
+              (ct-event :turn-done {:context {:tokens 41000}}))
+          text (ct-text m))
+      (is (includes? text "Claude Code · opus · subscription · profile dev"))
+      ;; the whole block repeats what streamed: written once
+      (assert= (count (string/split text "Hello.")) 2)
+      (is (includes? text "  ⏺ bash nest test\n    ⎿ 3 passed\n── 41k context ──"))
+      (is (string/ends-with? text "❯ half a thought"))
+      (assert= (:busy (session-of m "a1")) false)))
+  (test "RET sends the input as the next message and clears it"
+    (let (m (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "fix it")))
+      (let (sent (cmd-agent-return m nil))
+        (assert= (receive ([:prompt text] text) (after 1000 :nothing)) "fix it")
+        (is (string/ends-with? (ct-text sent) "» fix it\n\n❯ "))
+        (is (:busy (session-of sent "a1"))))))
+  (test "RET while the agent works sends nothing"
+    (let (m (update-session (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "more"))
+              "a1"
+              (fn (s) (assoc s :busy true))))
+      (cmd-agent-return m nil)
+      (assert= (receive ([:prompt text] text) (after 100 :nothing)) :nothing)))
+  (test "a refusal says why"
+    (is (includes? (ct-text (ct-event (ct-model) :refused "Claude Code is not signed in"))
+          "✗ not started: Claude Code is not signed in"))))
+
+(defn ct-pane-point (m)
+  "Where the selected window's cursor is: its own point, else the buffer's (a window that never
+moved its own has none)."
+  (or (:point (model/ed-current-pane m)) (buffer-point (ed-current-buf m))))
+
+(describe "the cursor sticks to the prompt"
+  (test "a window whose cursor is at the prompt keeps it there as text arrives above"
+    (let (m (ct-model)
+          before (ct-pane-point m)
+          after (ct-event m :text-delta "Hello there")
+          moved (ct-pane-point after))
+      (assert= moved (+ before (string/length "Hello there")))
+      (assert= moved (:input-start (ed-current-buf after)))))
+  (test "a window up in the transcript stays on what it was reading"
+    (let (m (ct-model)
+          up (ed-set-buf m (goto-char (ed-current-buf m) 2))
+          after (ct-event up :text-delta "Hello there"))
+      (assert= (ct-pane-point after) 2))))
+
+(describe "the transcript's colours"
+  (test "a tool call's name and arguments carry their faces; streamed text carries none"
+    (let (m (-> (ct-model)
+              (ct-event :text-delta "plain")
+              (ct-event :tool-use {:id "t" :name "mcp__bedit__grep" :input {:pattern "todo"}}))
+          buffer (ed-current-buf m)
+          faces (into [] (map (chat-face-spans buffer) (fn ([_ _ face]) face))))
+      (is (includes? faces :syntax/function))
+      (is (includes? faces :syntax/string))
+      (let (plain-at (index-of (buffer-text buffer) "plain"))
+        (is (not (any? (chat-face-spans buffer)
+                   (fn ([from to _]) (and (<= from plain-at) (< plain-at to))))))))))
+
+(defn ct-stream (m lines)
+  "`m` after the agent streamed `lines` lines of text."
+  (fold (range 0 lines) m (fn (model n) (ct-event model :text-delta (str "line " n "\n")))))
+
+(defn ct-chat-pane (m)
+  "The payload of the window showing the chat."
+  (let (layout (:layout m)
+        index (ed-buffer-index-by-name m "*agent: proj/dev*"))
+    (seq/find (map (editor/pane/pane-leaf-paths layout)
+                (fn (path) (editor/pane/pane-payload-at layout path)))
+      (fn (payload) (= (:buffer payload) index)))))
+
+(describe "the chat follows its tail, as a compile buffer does"
+  (test "the window you are in scrolls with the text while you are at the prompt"
+    (let (followed (ct-stream (ct-model) 80))
+      (is (> (or (:top (ct-chat-pane followed)) 0) 40))))
+  (test "so does a window you are not in"
+    (let (m (ct-model)
+          ;; a second window on another buffer, selected: the chat's window is not the one you are in
+          split (assoc m
+                  :layout
+                    (editor/pane/pane-other (editor/pane/pane-split (:layout m)
+                                              :col {:buffer 0 :top 0})))
+          followed (ct-stream split 80))
+      (is (not (= (:buffer (editor/pane/pane-selected-payload (:layout followed)))
+                 (ed-buffer-index-by-name followed "*agent: proj/dev*"))))
+      (is (> (or (:top (ct-chat-pane followed)) 0) 40))))
+  (test "a window scrolled up into the transcript stays where it is"
+    (let (streamed (ct-stream (ct-model) 80)
+          up (ed-set-buf streamed (goto-char (ed-current-buf streamed) 0))
+          scrolled-up (assoc up
+                        :layout
+                          (editor/pane/pane-update-selected (:layout up)
+                            (fn (payload) (assoc payload :top 0 :point 0))))
+          more (ct-stream scrolled-up 20))
+      (assert= (:top (ct-chat-pane more)) 0))))

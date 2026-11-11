@@ -1,0 +1,87 @@
+;; WHAT RAN. After a tool call ran, its handler tells the loop (`:ran`): the call is written under
+;; its row in the chat's transcript — what bedit knows of it, an edit's diff, a search's first
+;; matches, the end of a command's output — and the FEEDBACK rows are asked what the agent should
+;; hear about it. Feedback is a registry (`register-feedback`), claimed, so a package's row goes
+;; with the package: where to decide what the agent learns about its own work, and when. The
+;; built-in row tells it what bedit already shows in a file it just edited.
+
+(defmodule bedit-agent/feedback
+  "The `:ran` request (`ran-answer`) and the feedback registry (`register-feedback`)."
+  (:use model)
+  (:use agentkit/tool)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/workspace :only [relative diagnostics-of])
+  (:use bedit-agent/transcript :only [ed-chat-write write-ran first-line]))
+
+(defn register-feedback (name f)
+  "Add a feedback row `name`: `f` is a SYMBOL naming a `(m request) -> string or nil` fn, asked
+after every tool call that ran (`request` has `:session`, `:tool`, `:arguments` and `:result`),
+its answer added to what the agent reads. Claimed (`ownership`), so a package's row goes with
+it; registering `name` again replaces the row."
+  (ownership/claim! :bedit-agent/feedback name f))
+
+(defn- feedback-notes (m request)
+  (vec (seq/keep (vals (registry/entries :bedit-agent/feedback))
+         (fn (row)
+           (let (note (try
+                        ((reflect/eval row) m request)
+                        (catch e
+                          (do (log/warn (str "agent feedback " row ": " (error-message e))) nil))))
+             (if (string? note) note nil))))))
+
+(defn edit-diagnostics-feedback (m request)
+  "The built-in feedback: after an `edit` or `write` that worked, what bedit's checker or
+language server reports on the new text — the call waited for it to catch up
+(`sessions/settled-check`, its verdict in `:check`). When it had not reported in time, the
+agent is told to ask again rather than told the file is clean."
+  (when (and (includes? ["edit" "write"] (:tool request)) (:ok? (:result request)))
+    (let (session (session-of m (:session request))
+          path (bedit-agent/tools/absolute (or (:root session) "/")
+                 (str (:path (:arguments request))))
+          lines (diagnostics-of m path))
+      (cond
+        (= (:check request) "stale")
+          "bedit's checker has not reported on this change yet; call diagnostics in a moment to see what it finds."
+        (empty? lines)
+          (if (= (:check request) "current") "bedit's checker finds no problems in this file." nil)
+        else (str "bedit's checker reports in this file now:\n" (string/join lines "\n"))))))
+
+(register-feedback :edit-diagnostics 'bedit-agent/feedback/edit-diagnostics-feedback)
+
+(defn- ran-details (session request)
+  ;; the lines bedit writes under a call's row: an edit's change, a search's first matches,
+  ;; the end of a command's output
+  (let (result (:result request))
+    (cond
+      (:details result) (:details result)
+      (= (:tool request) "bash")
+        (vec (map (seq/take-last (string/split (string/trimr (or (:output result) "")) "\n") 3)
+               (fn (line) [line :syntax/comment])))
+      (includes? ["grep" "diagnostics"] (:tool request))
+        (vec (map (string/split (string/trimr (or (:output result) "")) "\n")
+               (fn (line) [(relative session line) :syntax/string])))
+      else [])))
+
+(defn ran-answer (m request &optional (size nil))
+  "`[m' result]` for a `:ran` request: what ran written under its row in a chat — the windows
+at its prompt following it when `size` (`[cols rows]`) is given — or said in the echo area for
+a TUI session's edit; then the feedback the agent reads."
+  (let (session (session-of m (:session request))
+        result (:result request)
+        written (cond
+                  (nil? session) m
+                  (= (:frontend session) :chat)
+                    (ed-chat-write m
+                      (:buffer session)
+                      (fn (buffer)
+                        (write-ran buffer
+                          {:tool (:tool request)
+                           :arguments (:arguments request)
+                           :ok? (:ok? result)
+                           :summary (or (:summary result) (first-line (:output result)))
+                           :details (ran-details session request)}))
+                      size)
+                  (and (includes? ["edit" "write"] (:tool request)) (:ok? result))
+                    (message m (str "agent " (title session) ": " (:summary result)))
+                  else m))
+    [written (succeeded (string/join (feedback-notes written request) "\n") "")]))

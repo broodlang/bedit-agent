@@ -1,0 +1,301 @@
+;; bedit's tools, as an agent sees them. Each is an `agentkit/tool` (name, schema, risk,
+;; handler). A handler runs in a process of its own — the MCP server's, or an API backend's
+;; worker — so what it needs from the EDITOR (a buffer's unsaved text, an edit made through a
+;; buffer, the diagnostics bedit holds) it asks the editor's loop for (`ask-loop`), and the
+;; loop answers from the model (`bedit-agent/bridge`). What needs no editor runs right in the
+;; handler, off the loop: a shell command, a search, reading a file bedit has not opened.
+;;
+;; Every tool that takes a path names it with `:paths`, so the guard can see where a call
+;; reaches: anything outside the project root and the profile's `:add-dirs` — symbolic links
+;; resolved, `..` and `~` included — asks first, whatever the profile allows.
+
+(defmodule bedit-agent/tools
+  "The bedit tool catalogue an agent session is offered: `catalogue` builds it for a session's
+root, its editor loop and its profile's `:tools`. Reads prefer what bedit holds over what is
+on disk (an open buffer's unsaved text), and edits go THROUGH bedit's buffers."
+  (:use agentkit/tool))
+
+;; The most characters of output one call hands back; longer keeps its head and tail.
+(def output-limit 60000)
+
+;; The largest file `read` reads from disk (bytes); a larger one is refused with its size.
+(def read-limit (* 4 1024 1024))
+
+;; How long a handler waits for the editor's loop to answer.
+(def loop-timeout-ms 30000)
+
+(defn clip (text)
+  "`text` cut to [[output-limit]] characters, its head and tail kept around a note.
+
+    (bedit-agent/tools/clip \"short\")   ;=> \"short\""
+  (let (length (string/length text))
+    (if (<= length output-limit)
+      text
+      (let (half (math/quot output-limit 2))
+        (str (string/substring text 0 half)
+          "\n… ["
+          (- length output-limit)
+          " characters cut] …\n"
+          (string/substring text (- length half) length))))))
+
+(defn numbered (text offset limit)
+  "Lines `offset`.. (1-based, at most `limit`) of `text`, each behind its number and a tab,
+as `cat -n` prints them.
+
+    (bedit-agent/tools/numbered \"a\\nb\\nc\" 2 1)   ;=> \"     2\\tb\""
+  (let (lines (string/split text "\n")
+        from (math/max 1 (or offset 1))
+        taken (take (drop lines (dec from)) (or limit 2000)))
+    (string/join (map (seq/enumerate taken)
+                   (fn ([index line]) (str (string/pad-left (str (+ from index)) 6) "\t" line)))
+      "\n")))
+
+(defn ask-loop (loop request &optional (timeout-ms loop-timeout-ms))
+  "Ask the editor's `loop` to answer `request` (`{:op …}`, see `bedit-agent/bridge`) and wait
+for its answer — a tool result — or a failed result once `timeout-ms` (default
+[[loop-timeout-ms]]) pass."
+  (let (tag (ref))
+    (send loop [:agent-tool request (self) tag])
+    (receive
+      ([:agent-tool-reply ^tag answer] answer)
+      (after timeout-ms (failed "bedit did not answer in time")))))
+
+(defn absolute (root path)
+  "`path` as the absolute, symlink-resolved path it names, a relative one taken under `root`.
+
+    (bedit-agent/tools/absolute \"/\" \"usr/../usr\")   ;=> \"/usr\""
+  (or (os/canonicalize (path/absolute path root)) (path/normalize (path/absolute path root))))
+
+(defn inside? (path roots)
+  "Whether absolute `path` is one of `roots` or under one.
+
+    (bedit-agent/tools/inside? \"/src/x/a.txt\" [\"/src/x\"])   ;=> true
+    (bedit-agent/tools/inside? \"/src/xy\" [\"/src/x\"])   ;=> false"
+  (any? roots
+    (fn (root)
+      (let (bare (if (and (string/ends-with? root "/") (> (string/length root) 1))
+                   (string/substring root 0 (dec (string/length root)))
+                   root))
+        (or (= path bare) (string/starts-with? path (if (= bare "/") "/" (str bare "/"))))))))
+
+;; ---- what runs without the editor ------------------------------------------------------
+
+(defn- shell (root command timeout-ms)
+  (let (result (try
+                 (os/cmd "sh" ["-c" command] {:cwd root :timeout-ms (or timeout-ms 120000)})
+                 (catch e (failure (error-message e)))))
+    (if (failure? result)
+      (failed (error-message result))
+      (let (out (str (:stdout result)
+                  (if (string/blank? (:stderr result)) "" (str "\n[stderr]\n" (:stderr result))))
+            code (:exit result)
+            text (clip (str out
+                         (cond
+                           (:timed-out result) "\n[timed out]"
+                           (not (= code 0)) (str "\n[exit " code "]")
+                           else ""))))
+        (assoc (succeeded text (if (:timed-out result) "timed out" (str "exit " code)))
+          :ok? (and (= code 0) (not (:timed-out result))))))))
+
+(defn- search (root args)
+  (let (pattern (:pattern args)
+        base (if (:path args) (absolute root (:path args)) root)
+        glob (:glob args)
+        ripgrep? (not (nil? (os/which "rg")))
+        argv (if ripgrep?
+               (append ["--line-number" "--no-heading" "--color" "never"]
+                 (if glob ["--glob" glob] [])
+                 ["--" pattern base])
+               ["-rn" "--" pattern base])
+        result (try
+                 (os/cmd (if ripgrep? "rg" "grep") argv {:cwd root :timeout-ms 60000})
+                 (catch e (failure (error-message e)))))
+    (cond
+      (failure? result) (failed (error-message result))
+      (= (:exit result) 1) (succeeded "no matches" "no matches")
+      (not (= (:exit result) 0)) (failed (string/trim (:stderr result)))
+      else
+        (let (text (string/replace (:stdout result) (str root "/") "")
+              found (count (string/split (string/trimr text) "\n")))
+          (succeeded (clip text) (str found (if (= found 1) " match" " matches")))))))
+
+(defn- glob-files (root args)
+  (let (result (try
+                 (if (os/which "rg")
+                   (os/cmd "rg" ["--files" "--glob" (:pattern args)] {:cwd root :timeout-ms 60000})
+                   (os/cmd "find"
+                     ["." "-path" (str "./" (:pattern args))]
+                     {:cwd root :timeout-ms 60000}))
+                 (catch e (failure (error-message e)))))
+    (cond
+      (failure? result) (failed (error-message result))
+      (string/blank? (:stdout result)) (succeeded "no files" "no files")
+      else
+        (let (files (sort (string/split (string/trimr (:stdout result)) "\n")))
+          (succeeded (clip (string/join files "\n")) (str (count files) " files"))))))
+
+(defn read-disk (path offset limit)
+  "File `path` as `read` answers it when bedit has no buffer for it: decoded as bedit decodes a
+file it opens (`pool/ed-read-file`: its coding, its line ends), numbered, refused past
+[[read-limit]] or when it is not text."
+  (let (size (file/size path))
+    (cond
+      (not (file/exists? path)) (failed (str "no such file: " path))
+      (file/dir? path) (failed (str path " is a directory; use glob to list it"))
+      (and (int? size) (> size read-limit))
+        (failed (str path
+                  " is " size " bytes, over the " read-limit
+                  "-byte limit; grep it, or read it in bedit"))
+      else
+        (let (read (try (pool/ed-read-file path) (catch e (failure (error-message e)))))
+          (cond
+            (failure? read) (failed (str "cannot read " path ": " (error-message read)))
+            (nil? (:text read)) (failed (str path " is not text"))
+            else
+              (let (text (:text read))
+                (succeeded (clip (numbered text offset limit))
+                  (str "read " (path/basename path) " (" (count (string/split text "\n")) " lines)"))))))))
+
+;; ---- the catalogue -----------------------------------------------------------------------
+
+(defn- object (properties required)
+  {:type "object" :properties properties :required required})
+
+(defn- path-of (root args)
+  ;; a call's one path, absolute — what `:paths` and the editor are given
+  (if (:path args) [(absolute root (:path args))] []))
+
+(defn all-tools (root loop &optional (id nil))
+  "Every bedit tool for session `id` in project `root`, whose editor loop is `loop`; each
+request it makes of the loop names the session. Each tool that takes a path has `:paths`,
+`(arguments) -> [absolute-path …]`, where the call reaches."
+  (let (ask-editor (fn (request) (ask-loop loop (assoc request :session id))))
+    [{:name "read"
+      :risk :read
+      :description "Read a file, as bedit has it: when the file is open in bedit its buffer's text is read, unsaved changes included (the answer says so). Lines are numbered. `offset` (1-based) and `limit` read part of a long file."
+      :schema (object {:path {:type "string"
+                              :description "The file, absolute or under the project root"}
+                       :offset {:type "integer"}
+                       :limit {:type "integer"}}
+                ["path"])
+      :paths (fn (args) (path-of root args))
+      :handler (fn (args)
+                 (let (path (absolute root (:path args))
+                       held (ask-editor {:op :read
+                                         :path path
+                                         :offset (:offset args)
+                                         :limit (:limit args)}))
+                   ;; the loop answers only for a buffer it has; the disk is read here, off it
+                   (if (= (:output held) "not-open")
+                     (read-disk path (:offset args) (:limit args))
+                     held)))}
+      {:name "list_buffers"
+       :risk :read
+       :description "The buffers open in bedit: name, file, and whether each has unsaved changes. What the user is looking at is marked."
+       :schema (object {} [])
+       :handler (fn (_args) (ask-editor {:op :buffers}))}
+      {:name "edit"
+       :risk :edit
+       :description "Replace `old_string` with `new_string` in a file, through its bedit buffer (one undo step there), and save it. `old_string` must occur exactly once unless `replace_all`. Refused when the buffer has unsaved changes of the user's, or the file changed on disk since bedit read it. An empty `old_string` on a file that does not exist creates it."
+       :schema (object {:path {:type "string"}
+                        :old_string {:type "string"}
+                        :new_string {:type "string"}
+                        :replace_all {:type "boolean"}}
+                 ["path" "old_string" "new_string"])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (ask-editor {:op :edit
+                               :path (absolute root (:path args))
+                               :old (:old_string args)
+                               :new (:new_string args)
+                               :all? (= true (:replace_all args))}))}
+      {:name "write"
+       :risk :edit
+       :description "Write a whole file through its bedit buffer and save it — a new file (its directories made), or one rewritten entirely. Prefer `edit` for a change to part of a file."
+       :schema (object {:path {:type "string"} :content {:type "string"}} ["path" "content"])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (ask-editor {:op :write
+                               :path (absolute root (:path args))
+                               :content (:content args)}))}
+      {:name "bash"
+       :risk :run
+       :description "Run a shell command (`sh -c`) in the project root and answer its output and exit code. For builds, tests, git."
+       :schema (object {:command {:type "string"} :timeout_ms {:type "integer"}} ["command"])
+       :handler (fn (args) (shell root (:command args) (:timeout_ms args)))}
+      {:name "grep"
+       :risk :read
+       :description "Search file contents for a regular expression (ripgrep), answering `file:line:text`. `path` narrows to a directory or file, `glob` to file names (\"*.blsp\")."
+       :schema (object {:pattern {:type "string"} :path {:type "string"} :glob {:type "string"}}
+                 ["pattern"])
+       :paths (fn (args) (if (:path args) (path-of root args) [root]))
+       :handler (fn (args) (search root args))}
+      {:name "glob"
+       :risk :read
+       :description "The project's files whose path matches a glob (\"src/**/*.blsp\"), ignored files left out."
+       :schema (object {:pattern {:type "string"}} ["pattern"])
+       :handler (fn (args) (glob-files root args))}
+      {:name "diagnostics"
+       :risk :read
+       :description "The errors and warnings bedit holds for a file (its language server or checker), or for every open buffer when no path is given."
+       :schema (object {:path {:type "string"}} [])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (ask-editor {:op :diagnostics
+                               :path (if (:path args) (absolute root (:path args)) nil)}))}
+      {:name "show_changes"
+       :risk :read
+       :description "Show the user what YOU changed this session — in one file, or in every file you touched — as a diff beside them in bedit, against each file's text before your first edit to it (the user's own edits since are not counted as yours). Use it when the user asks what you changed, or to walk them through your work. Answers the same diff."
+       :schema (object {:path {:type "string"
+                               :description "One file; omit for every file you changed"}}
+                 [])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (ask-editor {:op :changes
+                               :path (if (:path args) (absolute root (:path args)) nil)}))}
+      {:name "show_diff"
+       :risk :read
+       :description "Show the user a file's (or the whole project's) uncommitted changes against git's HEAD, as a diff beside them in bedit — everyone's changes, not only yours. Answers the same diff."
+       :schema (object {:path {:type "string" :description "One file; omit for the whole project"}}
+                 [])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (let (paths (if (:path args) ["--" (absolute root (:path args))] [])
+                        result (try
+                                 (os/cmd "git"
+                                   (into ["diff" "--no-color" "HEAD"] paths)
+                                   {:cwd root :timeout-ms 30000})
+                                 (catch e (failure (error-message e)))))
+                    (cond
+                      (failure? result) (failed (error-message result))
+                      (not (= (:exit result) 0)) (failed (string/trim (str (:stderr result))))
+                      else
+                        (ask-editor {:op :show-diff
+                                     :title (str (path/basename root) " vs HEAD")
+                                     :text (:stdout result)}))))}
+      {:name "show"
+       :risk :read
+       :description "Show the user a file in bedit, at a line, in another window — to point at what you are talking about."
+       :schema (object {:path {:type "string"} :line {:type "integer"}} ["path"])
+       :paths (fn (args) (path-of root args))
+       :handler (fn (args)
+                  (ask-editor {:op :show
+                               :path (absolute root (:path args))
+                               :line (if (int? (:line args)) (:line args) nil)}))}]))
+
+(defn catalogue (root loop names &optional (id nil))
+  "The tools for a session in `root` with editor `loop`: those named in `names` (a profile's
+`:tools`), or every one when `names` is nil.
+
+    (count (bedit-agent/tools/catalogue \"/x\" (self) [\"read\" \"grep\"]))   ;=> 2"
+  (let (tools (all-tools root loop id))
+    (if (nil? names) tools (vec (seq/filter tools (fn (tool) (includes? names (:name tool))))))))
+
+(defn describe-call (tool args)
+  "One line saying what a call of `tool` with `args` does — what a permission question and
+the transcript show.
+
+    (bedit-agent/tools/describe-call {:name \"bash\"} {:command \"nest test\"})   ;=> \"bash: nest test\""
+  (case (:name tool)
+    "bash" (str "bash: " (:command args))
+    (str (:name tool) (if (:path args) (str " " (:path args)) ""))))

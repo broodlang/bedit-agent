@@ -1,0 +1,398 @@
+;; PERMISSION. A tool call the session's profile allows — as it is now: the session menu changes
+;; it — is answered at once; so is one an earlier `a` covers. Anything else, and anything that
+;; reaches outside the project, waits in a queue (`:agent-asks`) shown IN A BUFFER of its own,
+;; `*agent: approvals*` — every request in full: a command whole and wrapped, an edit or a write
+;; as the diff it would make to the file as bedit has it, the project and session it comes from.
+;; The buffer opens beside you when a request arrives, the selection left where it is; the echo
+;; area gets one line, and the chip says how many wait. You answer in that buffer (C-c C-a in a
+;; chat, or a click on the chip, takes you there), the request at point, else the first:
+;;
+;;   y  allow        n  decline        a  allow from now on — this tool, or for `bash` this
+;;                                        very command — for the rest of the session
+;;   o  the file it is about           RET / TAB  the next request
+;;   q  put the buffer away (the requests keep waiting)
+;;
+;; Once nothing waits, its window goes as Emacs's quit-window takes a popup away: a window split
+;; off for it is deleted, a window it borrowed shows again what it showed. A key typed anywhere
+;; else never answers a request. A session that ends or is interrupted takes its requests with
+;; it, declined (`decline-asks`), and a request whose session has gone is declined unasked.
+
+(defmodule bedit-agent/permission
+  "The permission queue and its buffer: `permission-request` (a call decided at once or
+queued), `decline-asks` (a session's requests declined), `show-approvals` (the requests
+shown), and the buffer's commands."
+  (:use editor/buffer)
+  (:use editor/keymap :only [keymap-bind])
+  (:use editor/pane
+    :only [pane-leaf-paths
+      pane-payload-at pane-selected-path pane-select-path pane-count pane-delete pane-update-path])
+  (:use model)
+  (:use pool :only [ed-display-buffer ed-pop-to-file])
+  (:use interactive)
+  (:use agentkit/tool)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/workspace :only [reply relative current-text])
+  (:use bedit-agent/diffs :only [diff-lines unified-lines])
+  (:use bedit-agent/transcript :only [ed-chat-write write-under-call shown?]))
+
+;; The buffer the requests wait in.
+(def approvals-name "*agent: approvals*")
+
+;; ---- deciding a call ----------------------------------------------------------------------------
+
+(defn- always? (session request)
+  ;; an `a` answered earlier covers this call: this tool, or for `bash` this very command
+  (let (always (or (:always session) {}))
+    (if (= (:tool request) "bash")
+      (contains? (or (:commands always) #{}) (:command request))
+      (contains? (or (:tools always) #{}) (:tool request)))))
+
+(defn- note (m ask text face)
+  ;; the answer, under the call's row in a chat session's transcript (a TUI session's buffer is
+  ;; its terminal's)
+  (let (session (session-of m (:session ask))
+        request (:request ask))
+    (if (and session (= (:frontend session) :chat))
+      (ed-chat-write m
+        (:buffer session)
+        (fn (buffer)
+          (write-under-call buffer
+            (:tool request)
+            (:arguments request)
+            [["    " nil] [text face]])))
+      m)))
+
+(defn- target (session request)
+  ;; what a request is about, as its heading names it: the tool, and the file under the project
+  (let (path (first (or (:paths request) [])))
+    (str (:tool request)
+      (if (and path (not (= (:tool request) "bash"))) (str " " (relative session path)) ""))))
+
+(defn permission-request (m input)
+  "A tool call's permission request (`[:agent-tool {:op :permission …} reply-to tag]`): answered
+at once when the session's profile, as it is now, allows it (or an earlier `a` covers it) and it
+stays inside the project; else queued and shown in `*agent: approvals*`, beside you."
+  (let (request (nth input 1)
+        session (session-of m (:session request))
+        outside (if session (outside session (or (:paths request) [])) []))
+    (cond
+      (nil? session) (do (reply input (failed "no such session")) m)
+      ;; outside the project it asks, whatever the profile or an earlier answer says
+      (and (empty? outside)
+        (or (may-run? (:profile session) (:tool request) (:risk request) (:command request))
+          (always? session request)))
+        (do (reply input (succeeded "allow")) m)
+      else
+        (let (ask {:id (str "q" (inc (or (:agent-ask-count m) 0)))
+                   :input input
+                   :session (:id session)
+                   :request request
+                   :outside outside}
+              queued (assoc m
+                       :agent-asks (conj (or (:agent-asks m) []) ask)
+                       :agent-ask-count (inc (or (:agent-ask-count m) 0))))
+          (message (show-approvals queued :display)
+            (str (title session)
+              " asks to "
+              (target session request)
+              " — answer in "
+              approvals-name))))))
+
+;; ---- the buffer ---------------------------------------------------------------------------------
+
+(defn- replaced-once (text old new at)
+  (str (string/substring text 0 at)
+    new
+    (string/substring text (+ at (string/length old)) (string/length text))))
+
+(defn- proposed (m request)
+  ;; `[before after]`: the file an edit or a write changes, as bedit has it now and as the call
+  ;; would leave it — nil when that cannot be told (no file, or the text it replaces is not there)
+  (let (arguments (or (:arguments request) {})
+        path (first (or (:paths request) []))
+        before (if path (current-text m path) nil)
+        old (or (:old_string arguments) ""))
+    (cond
+      (nil? before) nil
+      (= (:tool request) "write") [before (or (:content arguments) "")]
+      (not (= (:tool request) "edit")) nil
+      (= old "") (if (= before "") [before (or (:new_string arguments) "")] nil)
+      (< (index-of before old) 0) nil
+      (:replace_all arguments) [before (string/replace before old (or (:new_string arguments) ""))]
+      else [before (replaced-once before old (or (:new_string arguments) "") (index-of before old))])))
+
+(defn- request-body (m session ask)
+  ;; what a request is shown with, as `[text face]` lines under its heading: a command whole, a
+  ;; change as the diff it would make
+  (let (request (:request ask)
+        arguments (or (:arguments request) {})
+        change (proposed m request))
+    (cond
+      (= (:tool request) "bash") [[(str "$ " (:command request)) :syntax/string]]
+      change
+        (let (label (relative session (first (:paths request)))
+              diff (diff/unified (first change)
+                     (second change)
+                     {:from-label (str "a/" label) :to-label (str "b/" label)}))
+          (if (= diff "") [["(it would change nothing)" :syntax/comment]] (unified-lines diff)))
+      (= (:tool request) "edit")
+        (diff-lines (or (:old_string arguments) "") (or (:new_string arguments) ""))
+      (= (:tool request) "write")
+        (vec (map (string/split (or (:content arguments) "") "\n")
+               (fn (line) [(str "+ " line) :syntax/string])))
+      else [[(:what request) :syntax/string]])))
+
+(defn- ask-lines (m ask)
+  ;; one request as `[text face]` lines: its heading, where it reaches outside, its body, the keys
+  (let (session (session-of m (:session ask))
+        request (:request ask)
+        heading (str "▸ "
+                  (if session (title session) "?")
+                  " — "
+                  (if session (target session request) (:tool request))
+                  (if (empty? (:outside ask)) "" "  (outside the project)"))
+        outside (if (empty? (:outside ask))
+                  []
+                  [[(str "  reaches " (string/join (:outside ask) ", ")) :syntax/error]])
+        key-line (str "  y allow · n decline · a always"
+                   (if (and (first (or (:paths request) [])) (not (= (:tool request) "bash")))
+                     " · o the file"
+                     "")))
+    (into (into [[heading :syntax/keyword]] outside)
+      (into (if session (request-body m session ask) [[(:what request) :syntax/string]])
+        [[key-line :syntax/comment] ["" nil]]))))
+
+(defn approvals-text (m)
+  "`[text spans blocks]`: the waiting requests as the buffer shows them — each a heading, its
+body and the keys — the faces, and each request's `[first-line last-line id]`."
+  (let (asks (or (:agent-asks m) []))
+    (if (empty? asks)
+      (let (empty "Nothing is waiting for your answer.")
+        [(str empty "\n") [[0 (string/length empty) :syntax/comment]] []])
+      (fold asks
+        ["" [] []]
+        (fn (progress ask)
+          (let ([text spans blocks] progress
+                lines (ask-lines m ask)
+                first-line (count (string/split text "\n"))
+                [grown faces] (fold lines
+                                [text spans]
+                                (fn (built [line face])
+                                  (let ([so-far found] built
+                                        at (string/length so-far))
+                                    [(str so-far line "\n")
+                                      (if face
+                                        (conj found [at (+ at (string/length line)) face])
+                                        found)]))))
+            [grown
+              faces
+              (conj blocks [(dec first-line) (+ (dec first-line) (dec (count lines))) (:id ask)])]))))))
+
+(defn- approvals-path (m)
+  ;; the path of a window showing *agent: approvals*, or nil
+  (let (index (ed-buffer-index-by-name m approvals-name)
+        layout (:layout m))
+    (if (nil? index)
+      nil
+      (seq/find (pane-leaf-paths layout)
+        (fn (path) (= (:buffer (pane-payload-at layout path)) index))))))
+
+(defn- remember-window (before after)
+  ;; `after` — the buffer just shown — with how to take its window away again (`:approvals-restore`),
+  ;; when this showing put it in a window: a window split off for it, or the payload of the one it took
+  (let (path (approvals-path after))
+    (cond
+      (or (nil? path) (approvals-path before)) after
+      (> (pane-count (:layout after)) (pane-count (:layout before)))
+        (assoc after :approvals-restore {:split true})
+      else
+        (let (payload (pane-payload-at (:layout before) path))
+          ;; the borrowed window's buffer kept by NAME: a kill meanwhile shifts the pool's indexes
+          (assoc after
+            :approvals-restore
+              {:payload payload
+               :name (editor/buffer/buffer-name (ed-buf-at before (:buffer payload)))})))))
+
+(defn- put-away (m)
+  ;; nothing waits: the approvals window taken away as quit-window takes a popup — a window split
+  ;; off for it deleted, a window it borrowed showing what it showed (deleted too when that
+  ;; buffer has gone since) — a lone window left as it is
+  (let (path (approvals-path m)
+        restore (:approvals-restore m)
+        layout (:layout m)
+        borrowed (if (:name restore) (ed-buffer-index-by-name m (:name restore)) nil)
+        cleared (dissoc m :approvals-restore))
+    (cond
+      (or (nil? path) (nil? restore) (<= (pane-count layout) 1)) cleared
+      borrowed
+        (assoc cleared
+          :layout
+            (pane-update-path layout path (fn (_) (assoc (:payload restore) :buffer borrowed))))
+      else
+        (let (selected (pane-selected-path layout)
+              kept (pane-payload-at layout selected)
+              pruned (pane-delete (pane-select-path layout path))
+              back (if (= selected path)
+                     nil
+                     (seq/find (pane-leaf-paths pruned)
+                       (fn (leaf) (= (pane-payload-at pruned leaf) kept)))))
+          (assoc cleared
+            :layout
+              (window-commands/ed-unside-lone-pane (if back (pane-select-path pruned back) pruned)))))))
+
+(defn show-approvals (m action)
+  "`m` with `*agent: approvals*` written afresh from the queue — `action` `:display` shows it
+beside you (the selection left put), `:none` refreshes it only where it is already shown — and,
+once nothing waits, its window taken away again."
+  (let ([text spans blocks] (approvals-text m)
+        shown (ed-display-buffer m
+                approvals-name
+                text
+                :agent-approvals {:action (if (or (= action :display) (shown? m approvals-name)) :display :none)
+                 :spans spans
+                 :keep-scroll true})
+        placed (remember-window m shown)
+        index (ed-buffer-index-by-name placed approvals-name)
+        stored (if index
+                 (ed-set-buf-at placed
+                   index
+                   (assoc (ed-buf-at placed index) :approval-blocks blocks))
+                 placed))
+    (if (and (= action :none) (empty? (or (:agent-asks stored) []))) (put-away stored) stored)))
+
+;; ---- answering ----------------------------------------------------------------------------------
+
+(defn- remember-always (m ask)
+  (let (request (:request ask))
+    (update-session m
+      (:session ask)
+      (fn (session)
+        (let (always (or (:always session) {}))
+          (assoc session
+            :always
+              (if (= (:tool request) "bash")
+                (assoc always :commands (conj (or (:commands always) #{}) (:command request)))
+                (assoc always :tools (conj (or (:tools always) #{}) (:tool request))))))))))
+
+(defn answer (m ask-id verdict)
+  "`m` with request `ask-id` answered `verdict` (`:allow`, `:always` or `:deny`): its tool call
+told, an `:always` remembered for the session, said under the call in its chat, gone from the
+buffer — and the buffer's window taken away once nothing waits."
+  (let (ask (seq/find (or (:agent-asks m) []) (fn (waiting) (= (:id waiting) ask-id))))
+    (if (nil? ask)
+      m
+      (let (rest-asks (assoc m
+                        :agent-asks
+                          (vec (seq/reject (:agent-asks m) (fn (waiting) (= (:id waiting) ask-id)))))
+            remembered (if (= verdict :always) (remember-always rest-asks ask) rest-asks))
+        (reply (:input ask) (succeeded (if (= verdict :deny) "deny" "allow")))
+        (show-approvals (note remembered
+                          ask
+                          (case verdict
+                            :deny "✗ declined"
+                            :always "✓ allowed (from now on, this session)"
+                            "✓ allowed")
+                          (if (= verdict :deny) :syntax/error :syntax/comment))
+          :none)))))
+
+(defn decline-asks (m session-id)
+  "`m` with every request session `session-id` has waiting answered `deny` and dropped: what
+ending or interrupting a session does."
+  (let (theirs (seq/filter (or (:agent-asks m) []) (fn (ask) (= (:session ask) session-id))))
+    (doseq (ask theirs) (reply (:input ask) (succeeded "deny")))
+    (if (empty? theirs)
+      m
+      (show-approvals (assoc m
+                        :agent-asks
+                          (vec (seq/reject (:agent-asks m) (fn (ask) (= (:session ask) session-id)))))
+        :none))))
+
+(defn- ask-at-point (m)
+  ;; the request the approvals buffer's point is in, else the first waiting
+  (let (buffer (ed-current-buf m)
+        asks (or (:agent-asks m) [])
+        line (buffer-current-line buffer)
+        block (seq/find (or (:approval-blocks buffer) [])
+                (fn ([from to _]) (and (>= line from) (<= line to)))))
+    (or (if block (seq/find asks (fn (ask) (= (:id ask) (nth block 2)))) nil) (first asks))))
+
+(defn- answered (m verdict)
+  (let (ask (ask-at-point m))
+    (if (nil? ask) (message m "nothing is waiting for your answer") (answer m (:id ask) verdict))))
+
+(defcommand cmd-agent-allow
+  (m key)
+  "In *agent: approvals*: allow the request at point (else the first)."
+  (answered m :allow))
+
+(defcommand cmd-agent-decline
+  (m key)
+  "In *agent: approvals*: decline the request at point (else the first)."
+  (answered m :deny))
+
+(defcommand cmd-agent-allow-always
+  (m key)
+  "In *agent: approvals*: allow the request at point, and from now on in its session — the tool,
+or for `bash` this very command."
+  (answered m :always))
+
+(defn- change-line (m request path)
+  ;; the 1-based line of `path` an edit would change, else 1
+  (let (old (or (map/get-in request [:arguments :old_string]) "")
+        text (current-text m path)
+        at (if (= old "") -1 (index-of text old)))
+    (if (< at 0) 1 (count (string/split (string/substring text 0 at) "\n")))))
+
+(defcommand cmd-agent-visit-request
+  (m key)
+  "In *agent: approvals*: the file the request at point is about, in another window — at the
+text an edit would change."
+  (let (ask (ask-at-point m)
+        request (:request ask)
+        path (first (or (:paths request) [])))
+    (cond
+      (nil? ask) (message m "nothing is waiting for your answer")
+      (or (nil? path) (= (:tool request) "bash")) (message m "this request is about no one file")
+      else (ed-pop-to-file m path (change-line m request path)))))
+
+(defcommand cmd-agent-next-request
+  (m key)
+  "In *agent: approvals*: point to the next request, round to the first."
+  (let (buffer (ed-current-buf m)
+        line (buffer-current-line buffer)
+        blocks (or (:approval-blocks buffer) [])
+        next (or (seq/find blocks (fn ([from _ _]) (> from line))) (first blocks)))
+    (if (nil? next)
+      m
+      (let ([from _to _id] next) (at-line m buffer from)))))
+
+(defn- at-line (m buffer line0:int)
+  ;; `buffer`, the selected one, with point at the start of 0-based `line0`
+  (ed-set-buf m (pool/ed-goto-line buffer (inc line0))))
+
+(defcommand cmd-agent-approvals
+  (m key)
+  "The requests the agents are waiting on you for, in *agent: approvals* — selected (C-c C-a in
+a chat)."
+  (let (shown (show-approvals m :display)
+        index (ed-buffer-index-by-name shown approvals-name))
+    (if index (pool/ed-pop-to-index shown index) shown)))
+
+(def approvals-keymap
+  (-> {}
+    (keymap-bind ["y"] 'bedit-agent/permission/cmd-agent-allow)
+    (keymap-bind ["n"] 'bedit-agent/permission/cmd-agent-decline)
+    (keymap-bind ["a"] 'bedit-agent/permission/cmd-agent-allow-always)
+    (keymap-bind ["o"] 'bedit-agent/permission/cmd-agent-visit-request)
+    (keymap-bind [:enter] 'bedit-agent/permission/cmd-agent-next-request)
+    (keymap-bind [:tab] 'bedit-agent/permission/cmd-agent-next-request)))
+
+(def approvals-layer
+  {:name 'agent-approvals
+   :doc "What the agents are waiting on you for: y allows, n declines, a allows from now on, o
+visits the file."
+   :keymap approvals-keymap
+   :commands (modes/layer-commands approvals-keymap)
+   :long-lines :wrap})
+
+(modes/register-special-type :agent-approvals 'bedit-agent/permission/approvals-layer)

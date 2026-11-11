@@ -1,0 +1,51 @@
+;; One real Claude Code turn on your SUBSCRIPTION (haiku, a few thousand tokens): the chat front
+;; end end to end — `start-session`, the tool server, the headless agent — with this script
+;; standing in for bedit's loop: every event folded into a model as the loop folds it, and a
+;; permission question answered `y`. Prints the transcript as the chat buffer shows it.
+;;
+;;   AGENT_LIVE_ROOT=/path/to/a/scratch/project nest run slow-tests/claude_live.blsp
+(defmodule claude-live)
+
+(defn- fold-message (m message)
+  (match message
+    ([:agent _ _ _] (bedit-agent/chat/ed-ev-agent m message nil 80 24))
+    ([:agent-tool _ _ _] (bedit-agent/bridge/ed-ev-agent-tool m message nil 80 24))
+    (_ m)))
+
+(defn- answer-questions (m)
+  ;; every request waiting in *agent: approvals* answered `y`, as you would there
+  (let (waiting (:agent-asks m))
+    (if (empty? (or waiting []))
+      m
+      (do
+        (io/puts "REQUEST:" (:what (:request (first waiting))))
+        (answer-questions (bedit-agent/permission/answer m (:id (first waiting)) :allow))))))
+
+(defn- run (m deadline)
+  (receive
+    (message
+      (let (next (answer-questions (fold-message m message)))
+        (if (and (= (first message) :agent) (includes? [:turn-done :refused :exited] (nth message 2)))
+          next
+          (run next deadline))))
+    (after (math/max 0 (- deadline (os/now))) (do (io/puts "TIMEOUT") m))))
+
+(defn main (& args)
+  (let (root (or (first args) (file/cwd))
+        profile {:name "live" :frontend :chat :model "haiku" :allow [:read]}
+        started (binding (editor/ui/*loop* (self))
+                  (bedit-agent/start/start-session (model/ed-init (editor/buffer/make-buffer "")) root profile))
+        session (bedit-agent/sessions/session-of started "a1"))
+    (send (:worker session)
+      [:prompt "Use the bedit edit tool to change hello to goodbye in a.txt, then call show_changes. Then reply with one word: done."])
+    (let (final (binding (editor/ui/*loop* (self)) (run started (+ (os/now) 180000))))
+      (io/puts "---- transcript ----")
+      (io/puts (editor/buffer/buffer-text (model/ed-buf-at final (model/ed-buffer-index-by-name final (:buffer session)))))
+      (io/puts "---- a.txt:" (file/slurp (path/join root "a.txt")))
+      ;; what M-x agent-resume would replay: the session read back from Claude Code's log
+      (let (claude-session (:claude-session (bedit-agent/sessions/session-of final "a1")))
+        (io/puts "---- history:"
+          (pr-str (map (agentkit/claude-code/history root claude-session) first))))
+      (bedit-agent/sessions/stop-processes (bedit-agent/sessions/session-of final "a1")))))
+
+(main (os/env "AGENT_LIVE_ROOT"))

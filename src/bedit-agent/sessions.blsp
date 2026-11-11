@@ -1,0 +1,265 @@
+;; A SESSION is one agent at work in one project under one profile. Several can run in a
+;; project at once, each with its own buffer, tool server and agent process. The model keeps
+;; them under `:agent-sessions` (id -> session); a session's buffer carries its id
+;; (`:agent-session`), which is how a buffer finds its session whatever it is renamed to.
+;;
+;; A session's PROCESSES — its tool server and its agent — are owned by the editor loop that
+;; started them: each watches the loop and goes with it, so a loop that dies or restarts
+;; leaves nothing running; and `stop-processes` takes them down when the session ends.
+;;
+;; Every tool call passes through `guard` in the tool server's handler process: the loop
+;; decides it against the session's profile as it is NOW (`bedit-agent/bridge`), asking the
+;; person when the profile does not allow it or the call reaches outside the project; and what
+;; ran goes back to the loop, which writes it into the transcript and answers with bedit's
+;; FEEDBACK on it — the point of serving the tools from bedit.
+
+(defmodule bedit-agent/sessions
+  "The agent sessions on the model: create, find (by id, buffer or agent process), update,
+end; the tool server each is served (`serve-tools`), the guard around every call, and the
+agent's process (`start-worker`, `restart-worker`)."
+  (:use agentkit/tool)
+  (:use bedit-agent/profiles :only [allowed? command-allowed?])
+  (:use bedit-agent/tools :only [catalogue ask-loop describe-call inside?]))
+
+;; How long a tool call waits for the person to answer its permission question.
+(def permission-timeout-ms (* 30 60 1000))
+
+;; Where a session's MCP config file is written (a private directory); a test binds its own.
+(defdyn bedit-agent/sessions/*config-dir* nil)
+
+(defn sessions (m)
+  "Every session on model `m`, id -> session."
+  (or (:agent-sessions m) {}))
+
+(defn session-of (m id)
+  "Session `id` on `m`, or nil."
+  (get (sessions m) id))
+
+(defn by-buffer (m name)
+  "The session whose buffer is called `name`, or nil."
+  (seq/find (vals (sessions m)) (fn (session) (= (:buffer session) name))))
+
+(defn by-worker (m worker)
+  "The session whose agent process is `worker`, or nil."
+  (seq/find (vals (sessions m)) (fn (session) (= (:worker session) worker))))
+
+(defn put-session (m session)
+  "`m` with `session` stored under its id."
+  (assoc m :agent-sessions (assoc (sessions m) (:id session) session)))
+
+(defn update-session (m id f)
+  "`m` with session `id` replaced by `(f session)`; unchanged when there is none."
+  (let (session (session-of m id)) (if session (put-session m (f session)) m)))
+
+(defn drop-session (m id)
+  "`m` without session `id`."
+  (assoc m :agent-sessions (dissoc (sessions m) id)))
+
+(defn next-id (m)
+  "A session id not yet used on `m`.
+
+    (bedit-agent/sessions/next-id {})   ;=> \"a1\""
+  (str "a" (inc (or (:agent-session-count m) 0))))
+
+(defn buffer-name-for (m root profile-name)
+  "The buffer name for a new session of `profile-name` in `root`: `*agent: bedit/dev*`, then
+`*agent: bedit/dev<2>*` while that is taken by a session or any buffer.
+
+    (bedit-agent/sessions/buffer-name-for {} \"/src/bedit\" \"dev\")   ;=> \"*agent: bedit/dev*\""
+  (let (base (str "*agent: " (path/basename root) "/" profile-name)
+        taken? (fn (name)
+                 (or (by-buffer m name)
+                   (any? (or (:buffers m) []) (fn (buffer) (= (:name buffer) name))))))
+    (letrec (free (fn (n)
+                    (let (name (if (= n 1) (str base "*") (str base "<" n ">*")))
+                      (if (taken? name) (free (inc n)) name))))
+      (free 1))))
+
+(defn project-sessions (m root)
+  "The sessions working in project `root`, oldest first."
+  (seq/sort-by (seq/filter (vals (sessions m)) (fn (session) (= (:root session) root))) :started))
+
+(defn title (session)
+  "How a session is named to a person: its project and profile, `bedit/dev`.
+
+    (bedit-agent/sessions/title {:root \"/src/bedit\" :profile {:name \"dev\"}})   ;=> \"bedit/dev\""
+  (str (path/basename (:root session)) "/" (map/get-in session [:profile :name])))
+
+;; ---- what a call may do ------------------------------------------------------------------------
+
+(defn reach (session)
+  "Where session `session`'s agent may work without asking: its project root and its profile's
+`:add-dirs`, absolute."
+  (vec (cons (:root session)
+         (map (or (map/get-in session [:profile :add-dirs]) [])
+           (fn (dir) (path/absolute dir (:root session)))))))
+
+(defn may-run? (profile tool-name risk command)
+  "Whether `profile` lets a call of `tool-name` (of `risk`; a `bash` call's `command`) run
+without asking.
+
+    (bedit-agent/sessions/may-run? {:allow [:read]} \"grep\" :read nil)   ;=> true
+    (bedit-agent/sessions/may-run? {:allow-commands [\"ls\"]} \"bash\" :run \"ls -la\")   ;=> true"
+  (or (allowed? profile risk)
+    (and (= tool-name "bash") (string? command) (command-allowed? profile command))))
+
+(defn outside (session paths)
+  "The `paths` a call reaches that are outside session `session`'s reach ([[reach]]) — `[]`
+when every one is inside."
+  (let (roots (reach session))
+    (vec (seq/reject paths (fn (path) (inside? path roots))))))
+
+;; ---- the guard ------------------------------------------------------------------------------------
+
+(defn guard (id loop)
+  "The wrap every tool call of session `id` goes through, in the handler's process. The editor
+`loop` decides the call (`:permission`): at once when the session's profile allows it, else
+by asking the person; a refusal is the result the agent reads. What ran goes back to the loop
+(`:ran`), which writes it into the transcript and answers with bedit's feedback, appended to
+what the agent reads."
+  (fn (tool arguments)
+    (let (paths (if (:paths tool) ((:paths tool) arguments) [])
+          reply (ask-loop loop
+                  {:op :permission
+                   :session id
+                   :tool (:name tool)
+                   :risk (or (:risk tool) :run)
+                   :command (if (= (:name tool) "bash") (str (:command arguments)) nil)
+                   :paths paths
+                   :arguments arguments
+                   :what (describe-call tool arguments)}
+                  permission-timeout-ms)
+          answer (if (:ok? reply) (keyword (:output reply)) :deny))
+      (if (= answer :deny)
+        (failed (str "the user declined: "
+                  (describe-call tool arguments)
+                  (if (string/blank? (or (:summary reply) "")) "" (str " (" (:summary reply) ")"))))
+        (let (result (run-tool tool arguments)
+              ;; after a change, bedit's checker is given a moment to report on the new text
+              check (if (and (includes? ["edit" "write"] (:name tool))
+                          (:ok? result)
+                          (not (empty? paths)))
+                      (settled-check loop id (first paths))
+                      nil)
+              feedback (ask-loop loop
+                         {:op :ran
+                          :session id
+                          :tool (:name tool)
+                          :arguments arguments
+                          :result result
+                          :check check}))
+          (if (and (:ok? feedback) (not (string/blank? (:output feedback))))
+            (assoc result :output (str (:output result) "\n\n" (:output feedback)))
+            result))))))
+
+;; How long a change waits for bedit's checker to report on it (ms) before its feedback goes.
+(def settle-ms 3000)
+
+(defn settled-check (loop id path)
+  "Wait, up to [[settle-ms]], for bedit's checking of `path` to catch up with the text a call
+just wrote: `\"current\"` once it has reported on it, `\"none\"` when nothing checks the file
+(nothing waited for), `\"stale\"` when it had not reported in time."
+  (letrec (poll (fn (deadline)
+                  (let (state (:output (ask-loop loop
+                                         {:op :diagnostics-state :session id :path path})))
+                    (if (and (= state "stale") (< (os/now) deadline))
+                      (do (receive (after 150 nil)) (poll deadline))
+                      state))))
+    (poll (+ (os/now) settle-ms))))
+
+;; ---- the tool server -----------------------------------------------------------------------------
+
+(defn- watch-loop (loop server)
+  ;; the tool server goes with the editor loop that owns it, and this watcher with the server
+  (spawn (let (loop-ref (monitor loop)
+               server-ref (monitor server))
+           (receive
+             ([:down ^loop-ref _ _] (exit server :kill))
+             ([:down ^server-ref _ _] nil)))))
+
+(defn serve-tools (root loop profile id)
+  "Start session `id`'s tool server: bedit's tools for `root` (the profile's `:tools`), each
+guarded ([[guard]]), over MCP's HTTP transport on loopback with a token, going with `loop`.
+Answers `mcp-server/start-http`'s `{:pid :port :token :url}`."
+  (let (wrap (guard id loop)
+        entries (vec (map (catalogue root loop (:tools profile) id)
+                       (fn (tool) (->mcp-entry tool wrap))))
+        server (mcp-server/start-http {:catalogue (fn () entries)
+                                       :info {:name "bedit" :version "0.1.0"}}))
+    (watch-loop loop (:pid server))
+    server))
+
+(defn config-dir ()
+  "The private directory sessions' MCP config files are written in."
+  (or bedit-agent/sessions/*config-dir* (path/join (projects/editor-state-dir) "agent")))
+
+(defn with-tools (session loop)
+  "`session` with its tool server started ([[serve-tools]], going with `loop`) and the MCP
+config file naming it written (`:server`, `:config-file`) — what a session starts with, and
+what an ended chat is given again when you write in it. A failure, the server stopped, when the
+file cannot be written."
+  (let (server (serve-tools (:root session) loop (:profile session) (:id session))
+        config (agentkit/claude-code/write-mcp-config {"bedit" {:url (:url server)
+                                                                :token (:token server)}}
+                 (config-dir)))
+    (if (failure? config)
+      (do (exit (:pid server) :kill) config)
+      (assoc session :server server :config-file config))))
+
+(defn stop-processes (session)
+  "Stop everything session `session` owns: its tool server, its agent and its MCP config
+file. Answers `session`."
+  (do
+    (when (map/get-in session [:server :pid]) (exit (map/get-in session [:server :pid]) :kill))
+    (when (:worker session) (send (:worker session) [:stop]))
+    (when (and (:config-file session) (file/exists? (:config-file session)))
+      (check-allow :discarded-catch (try (file/rm (:config-file session)) (catch _ nil))))
+    session))
+
+(defn instructions (profile)
+  "What a session's agent is told on top of its own system prompt: that it works inside
+bedit through bedit's tools, then the profile's `:instructions`."
+  (str "You are working inside bedit, an Emacs-like editor written in Brood. Your tools are "
+    "bedit's (the `bedit` MCP server): `read` sees the user's unsaved buffers, `edit` and "
+    "`write` change files through bedit's buffers and save them, `diagnostics` shows what "
+    "bedit's language servers and checkers report, `show` opens a file for the user at a "
+    "line, `show_changes` shows the user a diff of what you changed this session (use it when "
+    "they ask what you changed), `show_diff` their uncommitted changes against git. Some calls ask the user first; a declined call says so — do not retry it unchanged."
+    (if (:instructions profile) (str "\n\n" (:instructions profile)) "")))
+
+;; ---- the agent's process ---------------------------------------------------------------------
+
+(defn claude-options (session)
+  "What Claude Code session `session` is started with, either front end: where it runs, its
+model, effort and account, what it is told, and bedit's tools (the config file naming its
+tool server, written when the session started)."
+  (let (profile (:profile session))
+    {:cwd (:root session)
+     :model (:model profile)
+     :effort (:effort profile)
+     :append-system-prompt (instructions profile)
+     :config-dir (:config-dir session)
+     :add-dirs (:add-dirs profile)
+     :mcp-config-file (:config-file session)}))
+
+(defn start-worker (session loop)
+  "Start session `session`'s headless agent, reporting to and owned by the editor `loop`, and
+answer its pid. It has bedit's tools and none of its own, so every call it makes is bedit's
+to see and answer. A session that has talked before (`:claude-session`) is resumed: what a
+restart for a new model or effort keeps."
+  (agentkit/claude-code/start (assoc (claude-options session)
+                                :tools []
+                                :allowed-tools ["mcp__bedit"]
+                                :resume (:claude-session session)
+                                :owner loop)
+    loop))
+
+(defn restart-worker (session loop)
+  "Session `session` with its agent restarted under its profile as it is now — the
+conversation resumed — when a setting changed since it started (`:restart-pending`);
+unchanged otherwise. The old agent is stopped; what it still reports finds no session."
+  (if (and (:restart-pending session) (:worker session))
+    (do
+      (send (:worker session) [:stop])
+      (assoc session :worker (start-worker session loop) :restart-pending false))
+    session))

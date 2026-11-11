@@ -1,0 +1,146 @@
+;; The AGENT CHIP on the mode line, in any buffer of a project with a session: what the agent
+;; is doing, at a glance, wherever you are working.
+;;
+;;   ✦ dev · working 14s         a turn under way, its time ticking
+;;   ✦ dev · allow? 2 waiting    requests wait for your answer (amber): a click opens them,
+;;                               in *agent: approvals*
+;;   ✦ dev · 41k · 5h 62%        idle: the context the last turn filled, the plan's window
+;;
+;; The mode line keeps colour for a state that wants attention (theme.blsp): working is the
+;; accent, a waiting request amber, the rest the bar's own. A click goes to the session (to
+;; *agent: approvals* while requests wait); the tooltip
+;; has the model, effort, account, plan windows and what you answered "always" to.
+
+(defmodule bedit-agent/chip
+  "The agent's mode-line chip (`agent-segment`) and the beat that keeps a working session's
+time current."
+  (:use model)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat :only [current-session]))
+
+(defn- seconds (session)
+  (let (started (:turn-started session))
+    (if (int? started) (math/round (/ (- (os/now) started) 1000)) 0)))
+
+(defn- waiting (m session)
+  ;; the requests this session has waiting for your answer
+  (vec (seq/filter (or (:agent-asks m) []) (fn (ask) (= (:session ask) (:id session))))))
+
+(defn- as-seen (m session)
+  ;; `session` with what its buffer says: a TUI session whose Claude Code has exited is ended
+  (let (index (if session (ed-buffer-index-by-name m (:buffer session)) nil))
+    (if (and index (= (:frontend session) :tui) (:term-exited (ed-buf-at m index)))
+      (assoc session :status :ended :busy false)
+      session)))
+
+(defn chip-session (m)
+  "The session the selected buffer's chip is about — the session you are in, else the most
+recent live one in this buffer's project — as its buffer shows it, or nil."
+  (if (empty? (sessions m))
+    nil
+    (as-seen m
+      (or (current-session m)
+        ;; the buffer's project is the session root its file or directory is under: compared
+        ;; as strings, never looked up on disk — the chip is painted on every frame
+        (let (buffer (ed-current-buf m)
+              place (or (editor/buffer/buffer-file buffer) (:dir buffer) "")
+              live (seq/filter (vals (sessions m))
+                     (fn (session)
+                       (and (bedit-agent/tools/inside? place [(:root session)])
+                         (ed-buffer-index-by-name m (:buffer session))))))
+          (last (seq/sort-by live :started)))))))
+
+(defn- plan-text (limits)
+  ;; the busiest plan window, as `5h 62%`
+  (let (windows (seq/filter (vec (or limits {})) (fn ([_ state]) (number? (:used state)))))
+    (if (empty? windows)
+      nil
+      (let ([name state] (last (seq/sort-by windows (fn ([_ state]) (:used state)))))
+        (str (case name "five_hour" "5h" "seven_day" "7d" name)
+          " "
+          (math/round (* 100 (:used state)))
+          "%")))))
+
+(defn chip-text (m session)
+  "The chip's text for `session`.
+
+    (bedit-agent/chip/chip-text {} {:profile {:name \"dev\"} :status :ready})   ;=> \"✦ dev\""
+  (let (waiting-asks (waiting m session)
+        tokens (map/get-in session [:last-turn :context :tokens])
+        idle (seq/keep [(if (int? tokens) (str (math/round (/ tokens 1000)) "k") nil)
+                         (plan-text (:limits session))]
+               (fn (part) part)))
+    (str "✦ "
+      (map/get-in session [:profile :name])
+      (cond
+        (not (empty? waiting-asks)) (str " · allow? " (count waiting-asks) " waiting")
+        (:busy session) (str " · working " (seconds session) "s")
+        (= (:status session) :starting) " · starting"
+        (= (:status session) :refused) " · not started"
+        (= (:status session) :ended) " · ended"
+        (empty? idle) ""
+        else (str " · " (string/join idle " · "))))))
+
+(defn- chip-face (m session)
+  (cond
+    (not (empty? (waiting m session))) {:fg *yellow* :bold true}
+    (:busy session) {:fg *teal*}
+    (includes? [:refused :ended] (:status session)) {:fg *red*}
+    else {}))
+
+(defn- tooltip (m session)
+  (let (profile (:profile session)
+        always (or (:always session) {}))
+    (vec (seq/keep [(str (title session) " · " (->string (:frontend session)))
+                     (str "model "
+                       (or (:model session) (:model profile) "default")
+                       (if (:effort profile) (str " · effort " (:effort profile)) ""))
+                     (str "account "
+                       (if (:config-dir session)
+                         (path/abbreviate (:config-dir session))
+                         "bedit's own"))
+                     (if (empty? (or (:limits session) {}))
+                       nil
+                       (str "plan "
+                         (string/join (map (vec (:limits session))
+                                        (fn ([window state])
+                                          (str window
+                                            " "
+                                            (math/round (* 100 (or (:used state) 0)))
+                                            "%")))
+                           " · ")))
+                     (if (and (empty? (or (:tools always) #{}))
+                           (empty? (or (:commands always) #{})))
+                       nil
+                       (str "always: "
+                         (string/join (into (vec (or (:tools always) #{}))
+                                        (or (:commands always) #{}))
+                           ", ")))
+                     "click: the session · C-c C-o in it: the session menu"]
+           (fn (line) line)))))
+
+(defn agent-segment (m _pane _buffer)
+  "The agent chip as a segment, or nil when the selected buffer's project has no session."
+  (let (session (chip-session m))
+    (if (nil? session)
+      nil
+      (statusbar/seg :agent
+        (chip-text m session)
+        {:sep "  —  "
+         :face (chip-face m session)
+         :on-click (if (empty? (waiting m session))
+                     (quote bedit-agent/commands/cmd-agent)
+                     (quote bedit-agent/permission/cmd-agent-approvals))
+         :tooltip (fn (now) (tooltip now session))}))))
+
+(statusbar/register-modeline-segment :agent 45 'bedit-agent/chip/agent-segment)
+
+(defn tick (m)
+  "A beat each second while a session works, so the chip's time moves."
+  (if (any? (vals (sessions m)) :busy) {:every 1000} nil))
+
+(defn tick-fire (m)
+  "The beat's fire: nothing to change — the chip reads the clock when it is painted."
+  m)
+
+(register-timer-client :agent-tick 'bedit-agent/chip/tick 'bedit-agent/chip/tick-fire)

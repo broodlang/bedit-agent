@@ -1,0 +1,104 @@
+;; HANDING THE AGENT CONTEXT: what you are looking at, given to the session you mean — the one
+;; you are in, else this project's latest. In a chat it lands in your message, for you to add
+;; to and send; in a TUI session it is pasted into Claude Code (bracketed, as a paste).
+;;
+;; M-x agent-send-region       the region, quoted with its `file:line`
+;; M-x agent-send-buffer       this buffer's text, unsaved changes and all
+;; M-x agent-send-file         `@path` to this buffer's file
+;; M-x agent-send-diagnostics  what bedit shows in this buffer's file
+
+(defmodule bedit-agent/context
+  "The agent-send commands: what you are looking at, handed to the project's agent."
+  (:use editor/buffer)
+  (:use model)
+  (:use pool :only [ed-pop-to-index])
+  (:use interactive)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat :only [current-session])
+  (:use bedit-agent/start :only [project-root live-sessions])
+  (:use bedit-agent/workspace :only [diagnostics-of]))
+
+(defn- target-session (m)
+  ;; the session you mean: the one you are in, else this project's most recent
+  (or (current-session m) (last (live-sessions m (project-root m)))))
+
+(defn- hand-over (m text what)
+  ;; `text` given to the project's agent: into a chat's input, at its end (you send it), or
+  ;; pasted into a TUI session's Claude Code
+  (let (session (target-session m))
+    (cond
+      (nil? session) (message m "no agent session here (M-x claude starts one)")
+      (= (:frontend session) :chat)
+        (let (index (ed-buffer-index-by-name m (:buffer session)))
+          (if (nil? index)
+            (message m "the session's buffer is gone")
+            (let (buffer (ed-buf-at m index)
+                  added (insert (end-of-buffer buffer) text)
+                  ;; the chat beside you, its cursor at the end of your message
+                  popped (ed-pop-to-index (ed-set-buf-at m index added) index))
+              (message (ed-set-buf popped (end-of-buffer (ed-current-buf popped)))
+                (str what " added to your message — RET sends it")))))
+      else
+        (let (index (or (ed-buffer-index-by-name m (:buffer session)) -1)
+              process (if (>= index 0) (:term-proc (ed-buf-at m index)) nil))
+          (if (or (< index 0) (nil? process))
+            (message m "the session's terminal is gone")
+            (do
+              (send process [:term-paste text])
+              (message (ed-pop-to-index m index) (str what " pasted into Claude Code"))))))))
+
+(defn- file-reference (m buffer)
+  ;; how the agent is pointed at a buffer's file: `@path`, under the project root
+  (let (root (str (project-root m) "/")
+        file (buffer-file buffer))
+    (cond
+      (nil? file) nil
+      (string/starts-with? file root)
+        (str "@" (string/substring file (string/length root) (string/length file)))
+      else (str "@" file))))
+
+(defcommand cmd-agent-send-region
+  (m key)
+  "Hand the region to the project's agent, quoted with where it comes from (`file:line`)."
+  (let (buffer (ed-current-buf m)
+        mark (:mark buffer))
+    (if (nil? mark)
+      (message m "no region")
+      (let (from (math/min mark (buffer-point buffer))
+            to (math/max mark (buffer-point buffer))
+            text (string/substring (buffer-text buffer) from to)
+            line (inc (text/char->line (buffer-rope buffer) from))
+            where (str (or (file-reference m buffer) (buffer-name buffer)) ":" line))
+        (hand-over m (str where "\n```\n" text "\n```\n") "the region")))))
+
+(defcommand cmd-agent-send-file
+  (m key)
+  "Point the project's agent at this buffer's file (`@path` in your message)."
+  (let (reference (file-reference m (ed-current-buf m)))
+    (if (nil? reference)
+      (message m "this buffer visits no file")
+      (hand-over m (str reference " ") "the file"))))
+
+(defcommand cmd-agent-send-buffer
+  (m key)
+  "Hand the project's agent this buffer's text, unsaved changes and all."
+  (let (buffer (ed-current-buf m))
+    (hand-over m
+      (str (or (file-reference m buffer) (buffer-name buffer))
+        "\n```\n"
+        (buffer-text buffer)
+        "\n```\n")
+      "the buffer")))
+
+(defcommand cmd-agent-send-diagnostics
+  (m key)
+  "Hand the project's agent what bedit shows in this buffer's file: its errors and warnings."
+  (let (buffer (ed-current-buf m)
+        lines (if (buffer-file buffer)
+                (diagnostics-of m (buffer-file buffer))
+                []))
+    (if (empty? lines)
+      (message m "bedit shows no problems here")
+      (hand-over m
+        (str "bedit shows these problems:\n" (string/join lines "\n") "\n")
+        "the problems"))))

@@ -1,0 +1,314 @@
+;; The CHAT front end: a bedit buffer that is the conversation — the transcript above
+;; (`transcript`), your message below it (comint's input region: M-p / M-n / C-r recall what you
+;; sent). Whatever the backend reports arrives as `agentkit/events` and is folded here
+;; (`ed-ev-agent`), so a second backend changes nothing in this file.
+;;
+;; A message you send while the agent is still working is QUEUED: it shows in the transcript as
+;; `» … (queued)` and goes the moment the turn ends, as a person's next message would.
+;;
+;; The mode stands on markdown-mode: the agent writes Markdown — headings, lists, inline code, a
+;; fenced block coloured as its language.
+
+(defmodule bedit-agent/chat
+  "The agent chat buffer: its mode (RET sends — or, on a `path:line` in the transcript, opens it
+— C-j a newline, C-c C-c interrupts the turn, C-c C-k ends the session, C-c C-o the session
+menu), the session events folded into it (`ed-ev-agent`), and `open-chat`, which makes the
+buffer for a new session."
+  (:use editor/buffer)
+  (:use editor/keymap :only [keymap-bind])
+  (:use editor/layers :only [set-buffer-type])
+  (:use model)
+  (:use pool :only [ed-open-buffer])
+  (:use comint :only [input-text])
+  (:use interactive)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/transcript)
+  (:use bedit-agent/permission :only [decline-asks])
+  (:use bedit-agent/project-state :only [remember-session]))
+
+(defn current-session (m)
+  "The session of the selected buffer — a chat, or a TUI session's terminal — or nil."
+  (let (buffer (ed-current-buf m))
+    (if (:agent-session buffer)
+      (session-of m (:agent-session buffer))
+      (by-buffer m (buffer-name buffer)))))
+
+;; ---- sending -----------------------------------------------------------------------------------
+
+(defn- settings-line (session)
+  (str "── now "
+    (or (map/get-in session [:profile :model]) "the default model")
+    (if (map/get-in session [:profile :effort])
+      (str " · effort " (map/get-in session [:profile :effort]))
+      "")
+    " ──"))
+
+(defn- dispatch (m session text)
+  ;; `text` sent as the session's next message — the agent restarted first, the conversation
+  ;; resumed, when its model or effort changed since (the session menu) — and the session working
+  (let (restarted (restart-worker session (ed-loop-address))
+        changed? (not (= (:worker restarted) (:worker session)))
+        written (ed-chat-write m
+                  (:buffer session)
+                  (fn (buffer)
+                    (let (noted (if changed?
+                                  (transcript-line buffer (settings-line restarted))
+                                  buffer))
+                      (transcript-segments noted
+                        [["» " :syntax/keyword] [text :syntax/definition]]
+                        true)))))
+    (send (:worker restarted) [:prompt text])
+    (put-session written
+      (assoc restarted
+        :busy true
+        :turn-started (os/now)
+        :status :working
+        :queued []
+        ;; your first message names the session (M-x agent-resume lists it by it)
+        :title (or (:title restarted) (first-line text))))))
+
+(defn- take-input (m buffer text)
+  ;; `m` with the chat's input cleared and `text` kept in its history
+  (ed-set-buf m
+    (assoc (replace-region buffer (:input-start buffer) (buffer-length buffer) "")
+      :input-history (conj (or (:input-history buffer) []) text)
+      :input-history-index nil)))
+
+(defn- revived (m session)
+  ;; an ended session given its tool server and agent again, the conversation resumed — what
+  ;; writing in its chat does — or `m` with why it cannot be
+  (let (loop (ed-loop-address)
+        served (with-tools session loop))
+    (if (failure? served)
+      (message m (str "agent: not started again — " (error-message served)))
+      (let (session (assoc served :worker (start-worker served loop) :status :ready))
+        (put-session (ed-chat-write m
+                       (:buffer session)
+                       (fn (buffer) (transcript-line buffer "── the session goes on ──")))
+          session)))))
+
+(defn- send-input (m buffer session)
+  ;; the input sent as the next message, or queued behind the turn under way; an ended session
+  ;; started again first, its conversation resumed
+  (let (text (string/trim (input-text buffer)))
+    (cond
+      (string/blank? text) m
+      (nil? (:worker session))
+        (let (again (revived m session)
+              restarted (session-of again (:id session)))
+          (if (:worker restarted)
+            (dispatch (take-input again (ed-current-buf again) text) restarted text)
+            again))
+      (:busy session)
+        (let (taken (take-input m buffer text)
+              shown (ed-chat-write taken
+                      (:buffer session)
+                      (fn (chat)
+                        (transcript-segments chat
+                          [["» " :syntax/keyword]
+                            [text :syntax/definition]
+                            [" (queued)" :syntax/comment]]
+                          true))))
+          (message (put-session shown (assoc session :queued (conj (or (:queued session) []) text)))
+            "queued: it goes when this turn ends (C-c C-c interrupts the turn)"))
+      else (dispatch (take-input m buffer text) session text))))
+
+(defn- send-queued (m session)
+  ;; the messages that waited for the turn to end, sent as one
+  (let (queued (or (:queued session) []))
+    (if (or (empty? queued) (nil? (:worker session)))
+      m
+      (let (text (string/join queued "\n\n"))
+        (send (:worker session) [:prompt text])
+        (put-session m
+          (assoc session :busy true :turn-started (os/now) :status :working :queued []))))))
+
+;; ---- the session's events ----------------------------------------------------------------------
+
+(defn- session-after (session kind payload)
+  ;; the session as event `kind` leaves it
+  (case kind
+    :ready (assoc session :claude-session (:session payload) :model (:model payload) :status :ready)
+    :turn-done (assoc session :busy false :last-turn payload :status :ready)
+    :limits (assoc session :limits payload)
+    :error (assoc session :busy false)
+    :refused (assoc session :busy false :status :refused :worker nil)
+    :exited (assoc session :busy false :status :ended :worker nil)
+    session))
+
+(defn- remembered (m session kind payload)
+  ;; a chat session, once Claude names it, kept for the project (M-x agent-resume): by the
+  ;; first message you sent it, the profile and account it ran as
+  ;; — kept again at the end of each turn, so the resume menu's "2m ago" is when you last used it
+  (when (and (includes? [:ready :turn-done] kind)
+          (= (:frontend session) :chat)
+          (:claude-session session))
+    (remember-session (:root session)
+      {:claude-session (:claude-session session)
+       :profile (map/get-in session [:profile :name])
+       :title (or (:title session) "(no message yet)")
+       :at (os/now)
+       :config-dir (:config-dir session)}))
+  m)
+
+(defn- said-when-hidden (m session kind)
+  ;; a turn that ends while no window shows its chat is said in the echo area
+  (if (and (= kind :turn-done) (not (shown? m (:buffer session))))
+    (message m (str (title session) ": done" (elapsed session) " — in " (:buffer session)))
+    m))
+
+(defn ed-ev-agent (m input _textrows cols rows)
+  "An `agentkit/events` event from a session's agent (`[:agent worker kind payload]`): written
+into that session's transcript, the session moved (working, done, ended), and the messages
+queued behind a turn sent once it ends."
+  (let ([_ worker kind payload] input
+        session (by-worker m worker))
+    (cond
+      (nil? session) m
+      ;; a delta changes no session state: only the text
+      (= kind :text-delta)
+        (ed-chat-write m
+          (:buffer session)
+          (fn (buffer) (write-event buffer kind payload session))
+          [cols rows])
+      else
+        (let (after (session-after session kind payload)
+              moved (put-session m after)
+              written (if (= (:frontend session) :chat)
+                        (ed-chat-write moved
+                          (:buffer session)
+                          (fn (buffer) (write-event buffer kind payload session))
+                          [cols rows])
+                        moved)
+              said (said-when-hidden (remembered written after kind payload) session kind))
+          (if (= kind :turn-done) (send-queued said after) said)))))
+
+(register-event-handler :agent 'bedit-agent/chat/ed-ev-agent)
+
+;; ---- the buffer -------------------------------------------------------------------------------
+
+(defn open-chat (m session)
+  "`m` with a chat buffer for `session` (its `:buffer` name) opened and selected."
+  (let (header (str (map/get-in session [:profile :name])
+                 " in "
+                 (path/abbreviate (:root session))
+                 (if (:config-dir session) (str " · " (path/abbreviate (:config-dir session))) "")
+                 "\nRET sends · C-j a newline · C-c C-a approvals · C-c C-c interrupts · C-c C-o the menu\n")
+        base (disable-undo (set-buffer-type (make-buffer "" (:buffer session)) :agent-chat))
+        text (str header prompt)
+        buffer (assoc (end-of-buffer (insert base
+                                       text
+                                       {face-property [[0 (string/length text) :syntax/comment]]}))
+                 :dir (:root session)
+                 :agent-session (:id session)
+                 :transcript-end (string/length header)
+                 :input-start (string/length text)
+                 :input-history []
+                 :input-history-index nil
+                 :input-draft nil))
+    (ed-open-buffer m (input-only buffer))))
+
+(defn chat-line-loc (buffer line0)
+  "The `:line-loc` of a chat: a `path:line` on line `line0`, its path taken under the session's
+project (the buffer's `:dir`) — not bedit's working directory — or nil."
+  (let (found (results/default-line-loc buffer line0))
+    (if (and found (:file found) (:dir buffer))
+      (assoc found :file (path/absolute (:file found) (:dir buffer)))
+      found)))
+
+;; ---- the commands -----------------------------------------------------------------------------
+
+(defcommand cmd-agent-return
+  (m key)
+  "RET in an agent chat buffer: at the prompt, send what you typed as your next message (queued
+behind a turn under way); on a `path:line` in the transcript, open it in another window;
+anywhere else in the transcript, go back to the prompt."
+  (let (buffer (ed-current-buf m)
+        session (current-session m))
+    (cond
+      (nil? session) (message m "this buffer's session is gone")
+      (>= (buffer-point buffer) (:input-start buffer)) (send-input m buffer session)
+      (chat-line-loc buffer (buffer-current-line buffer)) (commands/cmd-visit-location m key)
+      else (ed-set-buf m (end-of-buffer buffer)))))
+
+(defcommand cmd-agent-beginning-of-line
+  (m key)
+  "C-a in an agent chat buffer: on your message's first line, its start (after the prompt);
+anywhere else, the start of the line."
+  (let (buffer (ed-current-buf m)
+        start (:input-start buffer)
+        point (buffer-point buffer)
+        line-start (line-start-of buffer point))
+    (ed-set-buf m
+      (goto-char buffer (if (and (>= point start) (<= line-start start)) start line-start)))))
+
+(defn- line-start-of (buffer position:int)
+  ;; where the line holding `position` starts — the rope asked, not the whole text
+  (text/line->char (buffer-rope buffer) (text/char->line (buffer-rope buffer) position)))
+
+(defcommand cmd-agent-newline
+  (m key)
+  "C-j in an agent chat buffer: a new line in your message, without sending it."
+  (let (buffer (ed-current-buf m))
+    (if (>= (buffer-point buffer) (:input-start buffer)) (ed-set-buf m (insert buffer "\n")) m)))
+
+(defcommand cmd-agent-interrupt
+  (m key)
+  "C-c C-c in an agent chat buffer: stop the turn in flight — its questions declined, the
+messages queued behind it dropped; the session goes on."
+  (let (session (current-session m))
+    (if (and session (:worker session) (:busy session))
+      (do
+        (send (:worker session) [:interrupt])
+        (message (decline-asks (put-session m (assoc session :queued [])) (:id session))
+          "interrupting…"))
+      (message m "the agent is not working"))))
+
+(defcommand cmd-agent-end
+  (m key)
+  "C-c C-k in an agent chat buffer: end the session — its agent and tool server stop, its
+questions are declined, its buffer stays to be read. Writing in it again goes on with the
+conversation."
+  (let (session (current-session m))
+    (if (or (nil? session) (nil? (:worker session)))
+      (message m "the session has ended already")
+      (let (ended (assoc session :worker nil :busy false :status :ended :queued [])
+            stored (put-session (decline-asks m (:id session)) ended))
+        (stop-processes session)
+        (message (if (= (:frontend session) :chat)
+                   (ed-chat-write stored
+                     (:buffer session)
+                     (fn (buffer)
+                       (transcript-line buffer "[the session ended — write below to go on with it]")))
+                   stored)
+          "the session ended")))))
+
+(def agent-chat-keymap
+  (-> {}
+    (keymap-bind [:enter] 'bedit-agent/chat/cmd-agent-return)
+    (keymap-bind [:ctrl-j] 'bedit-agent/chat/cmd-agent-newline)
+    (keymap-bind [:ctrl-c :ctrl-c] 'bedit-agent/chat/cmd-agent-interrupt)
+    (keymap-bind [:ctrl-c :ctrl-k] 'bedit-agent/chat/cmd-agent-end)
+    (keymap-bind [:ctrl-c :ctrl-o] 'bedit-agent/menu/cmd-agent-menu)
+    (keymap-bind [:ctrl-c :ctrl-a] 'bedit-agent/permission/cmd-agent-approvals)
+    (keymap-bind [:ctrl-a] 'bedit-agent/chat/cmd-agent-beginning-of-line)
+    (keymap-bind [:alt-p] 'comint/cmd-comint-previous-history)
+    (keymap-bind [:alt-n] 'comint/cmd-comint-next-history)
+    (keymap-bind [:ctrl-r] 'comint/cmd-comint-history-search)))
+
+(def agent-chat-layer
+  {:name 'agent-chat
+   :doc "An agent's conversation: the transcript, your message at the prompt."
+   :keymap agent-chat-keymap
+   ;; its M-x names are this mode's, not every buffer's
+   :commands (modes/layer-commands agent-chat-keymap {:except ["agent-menu" "agent-approvals"]})
+   ;; a `path:line` in the transcript is a link: the pointer, the hover, RET
+   :line-loc 'bedit-agent/chat/chat-line-loc
+   :electric-pair false
+   ;; no comint boundary guard: the transcript is read-only by narrowing already, and the guard
+   ;; reads the whole buffer as a string on every key — typing would slow as the chat grows
+   :long-lines :wrap})
+
+;; over markdown-mode: the agent writes Markdown, and a fenced block is coloured as its language
+(modes/register-type :agent-chat
+  (list 'bedit-agent/chat/agent-chat-layer 'modes/markdown-mode-layer 'modes/text-mode-layer))

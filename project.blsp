@@ -1,0 +1,19 @@
+;; bedit-agent — coding agents in bedit, as a hive PLUGIN package (`:enhances bedit`). A
+;; session is an agent working in one project under a PROFILE the project defines
+;; (.bedit-agent.blsp), several at once per project. Two front ends over the same profiles
+;; and the same tools: `:chat`, a bedit buffer where every tool the agent has is bedit's (it
+;; sees your unsaved buffers, edits through them, asks you in the echo area), and `:tui`, the
+;; agent's own terminal interface in a terminal buffer with bedit's tools added. The first
+;; backend is Claude Code on the SUBSCRIPTION (agentkit); the tools, profiles and sessions
+;; are the agent-neutral part.
+(project
+  :name "bedit-agent"
+  :version "0.1.0"
+  :brood ">= 0.50.0"
+  :description
+    "Coding agents in bedit: per-project profiles, several sessions per project, a chat buffer where every tool is bedit's, or the agent's own terminal UI with bedit's tools added. Claude Code on the subscription first."
+  :repository "https://github.com/broodlang/bedit-agent"
+  :enhances {bedit ">= 0.9"}
+  :dependencies [[agentkit :version "0.1.0"]]
+  :dev-dependencies [[bedit :path "../bedit"]]
+  :source-paths ["src"])

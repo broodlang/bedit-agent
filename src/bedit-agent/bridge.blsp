@@ -1,0 +1,96 @@
+;; The EDITOR's side of every tool call. A handler process asks the loop
+;; (`[:agent-tool request reply-to tag]`, `bedit-agent/tools/ask-loop`) and the loop answers
+;; from the model, then sends the result back (`workspace/reply`). Every request is answered, a
+;; failure included: a handler is never left waiting for a reply that is not coming.
+;;
+;; Where each request is answered:
+;;   :permission                      permission    (decided at once, or queued and asked)
+;;   :read :buffers :diagnostics :show  here         (what bedit holds; a file shown to you)
+;;   :edit :write :changes :show-diff edits         (through bedit's buffers; what changed)
+;;   :ran                             feedback      (written into the transcript; the feedback)
+
+(defmodule bedit-agent/bridge
+  "The loop's answer to every tool request (`ed-ev-agent-tool`), and the requests that only
+read what bedit holds."
+  (:use editor/buffer)
+  (:use model)
+  (:use pool :only [ed-pop-to-file])
+  (:use agentkit/tool)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/workspace :only [reply buffer-index-for diagnostics-of diagnostics-state])
+  (:use bedit-agent/edits :only [edit-answer write-answer changes-answer display-diff-answer])
+  (:use bedit-agent/permission :only [permission-request])
+  (:use bedit-agent/feedback :only [ran-answer]))
+
+;; ---- what bedit holds ------------------------------------------------------------------------
+
+(defn- read-answer (m request)
+  ;; an open buffer's text, unsaved changes and all; `not-open` sends the handler to the disk
+  (let (index (buffer-index-for m (:path request))
+        buffer (if index (ed-buf-at m index) nil))
+    (if (or (nil? buffer) (nil? (buffer-file buffer)))
+      (succeeded "not-open" "")
+      (succeeded (str (if (buffer-modified? buffer) "(open in bedit, with unsaved changes)\n" "")
+                   (bedit-agent/tools/clip (bedit-agent/tools/numbered (buffer-text buffer)
+                                             (:offset request)
+                                             (:limit request))))
+        (str "read " (path/basename (:path request)) (if (buffer-modified? buffer) " (unsaved)" ""))))))
+
+(defn- buffers-answer (m)
+  (let (current (buffer-name (ed-current-buf m))
+        rows (for (buffer (:buffers m) :into [])
+               (str (if (= (buffer-name buffer) current) "* " "  ")
+                 (buffer-name buffer)
+                 (if (buffer-file buffer) (str "  " (buffer-file buffer)) "")
+                 (if (and (buffer-file buffer) (buffer-modified? buffer)) "  (unsaved changes)" ""))))
+    (succeeded (string/join rows "\n") (str (count rows) " buffers"))))
+
+(defn- diagnostics-answer (m request)
+  (let (lines (diagnostics-of m (:path request)))
+    (if (empty? lines)
+      (succeeded (if (:path request)
+                   "bedit shows no problems in that file (or it is not open; `show` opens it)"
+                   "bedit shows no problems in the open buffers")
+        "no problems")
+      (succeeded (string/join lines "\n")
+        (str (count lines) (if (= (count lines) 1) " problem" " problems"))))))
+
+(defn- show-answer (m request)
+  ;; the file in another window, at the line — the chat you are typing in stays where it is
+  [(ed-pop-to-file m (:path request) (or (:line request) 1))
+    (succeeded (str "showing " (:path request)) "shown")])
+
+;; ---- the event ---------------------------------------------------------------------------------
+
+(defn- answer-request (m input request size)
+  ;; `[m' result]` for every request but a permission question; `size` the window's `[cols
+  ;; rows]`, so a transcript written into follows its prompt
+  (let (session (session-of m (:session request)))
+    (case (:op request)
+      :read [m (read-answer m request)]
+      :buffers [m (buffers-answer m)]
+      :diagnostics [m (diagnostics-answer m request)]
+      :diagnostics-state [m (succeeded (->string (diagnostics-state m (:path request))))]
+      :ran (ran-answer m request size)
+      :show (show-answer m request)
+      :changes (changes-answer m request)
+      :show-diff (display-diff-answer m request)
+      :edit (edit-answer m session request)
+      :write (write-answer m session request)
+      [m (failed (str "unknown request " (:op request)))])))
+
+(defn ed-ev-agent-tool (m input _textrows cols rows)
+  "A tool request from a session's handler (`[:agent-tool request reply-to tag]`): answered
+from the model, which it may change (an edit, a file shown). Always answered: a request that
+fails says why."
+  (let (request (nth input 1))
+    (if (= (:op request) :permission)
+      (permission-request m input)
+      (let ([next result] (try
+                            (answer-request m input request [cols rows])
+                            (catch e
+                              [m (failed (str (->string (:op request)) ": " (error-message e)))])))
+        (reply input result)
+        next))))
+
+(register-event-handler :agent-tool 'bedit-agent/bridge/ed-ev-agent-tool)

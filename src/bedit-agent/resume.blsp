@@ -1,0 +1,97 @@
+;; RESUMING a chat: every chat session is kept for its project once Claude names it
+;; (`project-state/remember-session`, by the first message you sent it), and `M-x agent-resume`
+;; offers them, newest first. Choosing one starts a chat that resumes that Claude session — the
+;; conversation goes on where it stopped, as the account it ran as — and shows it first: the
+;; session's log, read off the loop (`agentkit/claude-code/history`), written into the new
+;; transcript as the live session would have written it.
+
+(defmodule bedit-agent/resume
+  "M-x agent-resume: a past chat of this project, its transcript shown again, the conversation
+going on."
+  (:use model)
+  (:use pool :only [ed-name-prompt])
+  (:use interactive)
+  (:use bedit-agent/profiles :only [resolve])
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/transcript :only [ed-chat-write write-event transcript-line])
+  (:use bedit-agent/project-state :only [past-sessions])
+  (:use bedit-agent/start :only [project-root profiles-here start-session]))
+
+(defn age (at:int now:int)
+  "How long ago epoch-ms `at` was, from `now`, as a person says it.
+
+    (bedit-agent/resume/age 0 (* 3 60 60 1000))   ;=> \"3h ago\""
+  (let (seconds (math/quot (- now at) 1000))
+    (cond
+      (< seconds 60) "just now"
+      (< seconds 3600) (str (math/quot seconds 60) "m ago")
+      (< seconds 86400) (str (math/quot seconds 3600) "h ago")
+      else (str (math/quot seconds 86400) "d ago"))))
+
+(defn entry-label (entry now)
+  "How the menu shows past session `entry`: what it was about, when, under which profile.
+
+    (bedit-agent/resume/entry-label {:title \"fix the tests\" :at 0 :profile \"dev\"} 120000)   ;=> \"fix the tests — 2m ago · dev\""
+  (str (:title entry) " — " (age (or (:at entry) 0) now) " · " (:profile entry)))
+
+(defn- resume (m root profiles entry)
+  ;; a chat resuming `entry`, its history read off the loop and shown when it lands
+  (let (profile (or (resolve profiles (:profile entry))
+                  (resolve profiles "claude")
+                  {:name "claude"})
+        id (next-id m)
+        started (start-session m root (assoc profile :frontend :chat) entry)
+        session (session-of started id)
+        loop (ed-loop-address))
+    (if (nil? session)
+      started
+      (do
+        (spawn (send loop
+                 [:agent-history
+                   (:id session)
+                   (agentkit/claude-code/history root (:claude-session entry) (:config-dir entry))]))
+        (message started (str "resuming “" (:title entry) "”…"))))))
+
+(defn ed-ev-agent-history (m input _textrows cols rows)
+  "A resumed session's history read (`[:agent-history id events]`): written into its transcript
+as the live session wrote it, then a line saying the conversation goes on below."
+  (let ([_ id events] input
+        session (session-of m id))
+    (cond
+      (nil? session) m
+      (failure? events)
+        (ed-chat-write m
+          (:buffer session)
+          (fn (buffer)
+            (transcript-line buffer
+              (str "(its transcript could not be read: " (error-message events) ")"))))
+      else
+        (ed-chat-write m
+          (:buffer session)
+          (fn (buffer)
+            (transcript-line (fold events
+                               buffer
+                               (fn (written [kind payload])
+                                 (write-event written kind payload session)))
+              "── resumed: the conversation goes on below ──"))
+          [cols rows]))))
+
+(register-event-handler :agent-history 'bedit-agent/resume/ed-ev-agent-history)
+
+(defcommand cmd-agent-resume
+  (m key)
+  "Go on with an earlier chat in this project: a menu of its past sessions, newest first, by the
+first message you sent each. The chosen one opens with its transcript, and its conversation
+goes on where it stopped."
+  (let ([root profiles told] (profiles-here m)
+        past (past-sessions root)
+        now (os/now))
+    (if (empty? past)
+      (message told "no earlier chats in this project (M-x claude starts one)")
+      (assoc told
+        :minibuffer
+          (ed-name-prompt "Resume chat: "
+            (map past (fn (entry) (entry-label entry now)))
+            (fn (answered text)
+              (let (entry (seq/find past (fn (candidate) (= (entry-label candidate now) text))))
+                (if entry (resume answered root profiles entry) answered))))))))

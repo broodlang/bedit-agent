@@ -1,0 +1,61 @@
+;; Which Claude ACCOUNT a session runs as. Claude Code keeps an account in a config directory —
+;; `~/.claude` unless `CLAUDE_CONFIG_DIR` names another — and people with several (work,
+;; personal, a client's org) keep them side by side as `~/.claude-work`, `~/.claude-personal`.
+;; Which one a project uses is its own (`project-state`).
+
+(defmodule bedit-agent/accounts
+  "Claude accounts: the config directories found under home (`discover`), each labelled with
+its account (`label`).")
+
+(defn- home () (or (path/home) "/"))
+
+(defn account-dir? (dir)
+  "Whether `dir` holds a Claude Code login: a `.credentials.json` or a `.claude.json` in it."
+  (and (file/dir? dir)
+    (or (file/exists? (path/join dir ".credentials.json"))
+      (file/exists? (path/join dir ".claude.json")))))
+
+(defn discover (&optional (base nil))
+  "The Claude config directories under `base` (default: home) — `.claude` and every
+`.claude-*` that holds a login — sorted, `.claude` first.
+
+    (bedit-agent/accounts/discover \"/no/such/home\")   ;=> []"
+  (let (root (or base (home))
+        names (if (file/dir? root) (file/ls root) [])
+        candidates (seq/filter names
+                     (fn (name) (or (= name ".claude") (string/starts-with? name ".claude-")))))
+    (vec (seq/sort-by (seq/filter (map candidates (fn (name) (path/join root name))) account-dir?)
+           (fn (dir) (if (= (path/basename dir) ".claude") "" (path/basename dir)))))))
+
+(defn- state-json (dir)
+  ;; where the account's details are: `~/.claude.json` for the default dir, else inside it
+  (let (inside (path/join dir ".claude.json"))
+    (if (or (file/exists? inside) (not (= (path/basename dir) ".claude")))
+      inside
+      (path/join (path/dirname dir) ".claude.json"))))
+
+(defn- json-string (text key)
+  ;; the first `"key": "value"` in `text` — the account files run to hundreds of KB, and only
+  ;; two fields of one object are wanted, so they are found rather than the whole file parsed
+  (when-let (found (regex/find (str "\"" key "\"\\s*:\\s*\"([^\"]*)\"") text))
+    (:text (first (:groups found)))))
+
+(defn account (dir)
+  "`{:dir :email :org}` for config directory `dir`, the account fields nil when its file does
+not say."
+  (let (file (state-json dir)
+        text (if (file/exists? file)
+               (try (file/slurp file) (catch e (do (log/warn (error-message e)) "")))
+               ""))
+    {:dir dir :email (json-string text "emailAddress") :org (json-string text "organizationName")}))
+
+(defn label (account)
+  "How the menu shows `account`: its directory as `~/…`, then who it is.
+
+    (bedit-agent/accounts/label {:dir \"/home/me/.claude-work\" :email \"me@work.com\" :org \"Work\"})   ;~> \"~/.claude-work — me@work.com · Work\""
+  (str (path/abbreviate (:dir account))
+    (if (:email account) (str " — " (:email account)) "")
+    (if (:org account) (str " · " (:org account)) "")))
+
+;; The menu entry for "no choice saved": what bedit itself was started with.
+(def inherit-label "(none saved: what bedit was started with)")

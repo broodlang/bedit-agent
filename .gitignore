@@ -1,0 +1,5 @@
+_deps/
+*.swp
+.DS_Store
+.brood_crash_dump
+.brood/

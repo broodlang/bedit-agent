@@ -1,0 +1,118 @@
+(defmodule bridge-test
+  (:use test)
+  (:use model)
+  (:use pool :only [ed-find-file])
+  (:use editor/buffer)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/bridge)
+  (:use bedit-agent/permission))
+
+(defn bt-setup ()
+  "`[model dir file]`: a scratch file with three lines, and a session rooted at its dir."
+  (let (dir (path/join (or (test/scratch-dir) "/tmp") (str "bridge-" (rand/token 6)))
+        file (path/join dir "notes.txt"))
+    (file/mkdir dir)
+    (file/spit file "one\ntwo\nthree\n")
+    [(put-session (ed-init (make-buffer ""))
+       {:id "a1" :root dir :profile {:name "dev"} :buffer "*agent: x/dev*"})
+      dir file]))
+
+(defn bt-ask (m request)
+  "`[model' result]`: `request` put to the loop's handler, and what it sent back."
+  (let (tag (ref)
+        next (ed-ev-agent-tool m [:agent-tool request (self) tag] nil 80 24))
+    [next (receive ([:agent-tool-reply ^tag result] result) (after 1000 :no-reply))]))
+
+(describe "the loop's answers"
+  (test "read prefers the buffer's unsaved text, and says so"
+    (let ([m _dir file] (bt-setup)
+          opened (ed-find-file m file)
+          edited (ed-set-buf opened (insert (goto-char (ed-current-buf opened) 0) "zero\n"))
+          [_ result] (bt-ask edited {:op :read :path file}))
+      (is (:ok? result))
+      (is (includes? (:output result) "unsaved changes"))
+      (is (includes? (:output result) "     1\tzero"))))
+  (test "read of a file bedit has not open reads the disk"
+    (let ([m _dir file] (bt-setup)
+          [_ held] (bt-ask m {:op :read :path file}))
+      ;; the loop has no buffer for it: the handler reads the disk itself, off the loop
+      (assert= (:output held) "not-open")
+      (assert= (:output (bedit-agent/tools/read-disk file 2 1)) "     2\ttwo")))
+  (test "an edit goes through the buffer and is saved"
+    (let ([m _dir file] (bt-setup)
+          [next result] (bt-ask m {:op :edit :session "a1" :path file :old "two" :new "TWO"}))
+      (assert= (:output result) "edited notes.txt:2 (1 replacement)")
+      (assert= (file/slurp file) "one\nTWO\nthree\n")
+      (let (index (ed-buffer-index-by-file next file))
+        (is (and (int? index) (not (buffer-modified? (ed-buf-at next index))))))))
+  (test "an edit is refused when the text is ambiguous, missing, or the buffer has your changes"
+    (let ([m _dir file] (bt-setup))
+      (file/spit file "a a\n")
+      (is (not (:ok? (second (bt-ask m {:op :edit :path file :old "a" :new "b"})))))
+      (is (:ok? (second (bt-ask m {:op :edit :path file :old "a" :new "b" :all? true}))))
+      (is (not (:ok? (second (bt-ask m {:op :edit :path file :old "zzz" :new "b"})))))
+      (let (opened (ed-find-file m file)
+            dirty (ed-set-buf opened (insert (ed-current-buf opened) "mine"))
+            [_ result] (bt-ask dirty {:op :edit :path file :old "b" :new "c"}))
+        (is (not (:ok? result)))
+        (is (includes? (:output result) "unsaved changes")))))
+  (test "write creates a file"
+    (let ([m dir _file] (bt-setup)
+          fresh (path/join dir "new.txt")
+          [_ result] (bt-ask m {:op :write :path fresh :content "hello\n"}))
+      (is (:ok? result))
+      (assert= (file/slurp fresh) "hello\n"))))
+
+(defn bt-request (m request)
+  "`[model' tag]`: a permission request put to the loop; its answer comes later."
+  (let (tag (ref))
+    [(ed-ev-agent-tool m
+       [:agent-tool (assoc request :op :permission :session "a1") (self) tag]
+       nil
+       80
+       24)
+      tag]))
+
+(defn bt-answer (tag)
+  (receive ([:agent-tool-reply ^tag result] (:output result)) (after 1000 :none)))
+
+(describe "permission"
+  (test "a request waits in *agent: approvals*, shown whole, and the answer goes back"
+    (let ([m _dir _file] (bt-setup)
+          [queued tag] (bt-request m
+                         {:tool "bash"
+                          :risk :run
+                          :command "rm -rf build && make all"
+                          :what "bash: rm -rf build && make all"})
+          index (ed-buffer-index-by-name queued "*agent: approvals*"))
+      (assert= (count (:agent-asks queued)) 1)
+      (is (int? index))
+      (is (includes? (buffer-text (ed-buf-at queued (or index 0))) "$ rm -rf build && make all"))
+      ;; one line in the echo area, never the request
+      (is (includes? (:echo queued) "answer in *agent: approvals*"))
+      (let (answered (answer queued (:id (first (:agent-asks queued))) :always))
+        (assert= (bt-answer tag) "allow")
+        (assert= (:agent-asks answered) [])
+        (is (includes? (buffer-text (ed-buf-at answered (or index 0))) "Nothing is waiting"))
+        ;; `a`: that very command is not asked about again
+        (let ([again tag2] (bt-request answered
+                             {:tool "bash" :risk :run :command "rm -rf build && make all" :what "x"}))
+          (assert= (count (:agent-asks again)) 0)
+          (assert= (bt-answer tag2) "allow")))))
+  (test "a key in the approvals buffer answers the request at point"
+    (let ([m _dir _file] (bt-setup)
+          [one tag1] (bt-request m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          [two tag2] (bt-request one
+                       {:tool "edit"
+                        :risk :edit
+                        :what "edit x"
+                        :arguments {:old_string "a" :new_string "b"}})
+          opened (cmd-agent-approvals two nil)
+          buffer (ed-current-buf opened)
+          on-second (ed-set-buf opened (goto-char buffer (index-of (buffer-text buffer) "+ b")))
+          declined (cmd-agent-decline on-second nil))
+      (is (includes? (buffer-text buffer) "- a\n+ b"))
+      (assert= (bt-answer tag2) "deny")
+      (assert= (bt-answer tag1) :none)
+      (cmd-agent-allow declined nil)
+      (assert= (bt-answer tag1) "allow"))))

@@ -1,0 +1,173 @@
+;; The agent commands: opening, finding and ending sessions, profiles and trust.
+;;
+;; M-x claude             this project's chat session, or a new one (the `claude` profile)
+;; M-x claude-tui         this project's Claude Code terminal session, or a new one
+;; M-x agent              this project's latest session, or one under its default profile
+;; M-x agent-new          another session here, under a profile you pick
+;; M-x agent-switch       any running session, in any project
+;; M-x agent-account      which Claude account this project's sessions run as
+;; M-x agent-profiles     the project's .bedit-agent.blsp (a starting one written if missing)
+;; M-x agent-trust-project  let that file widen what its agents may do
+;; M-x agent-send-region / agent-send-buffer / agent-send-file / agent-send-diagnostics
+;;                        hand the project's agent what you are looking at
+
+(defmodule bedit-agent/commands
+  "The agent commands — M-x claude, claude-tui, agent, agent-new, agent-switch, agent-account,
+agent-profiles, agent-trust-project — and what ends a session when its buffer goes."
+  (:use editor/buffer)
+  (:use model)
+  (:use pool :only [ed-find-file ed-select ed-name-prompt])
+  (:use interactive)
+  (:use bedit-agent/profiles)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/start)
+  (:use bedit-agent/project-state :only [trusted? set-trusted past-sessions])
+  (:use bedit-agent/permission :only [decline-asks]))
+
+(defcommand cmd-agent-account
+  (m key)
+  "Choose which Claude account this project's agent sessions run as: a menu of the Claude
+config directories under your home (`~/.claude`, `~/.claude-*`), each with its account. Saved
+for this project, in bedit's state — not in the project's committed files."
+  (ask-accounts m (project-root m) {}))
+
+;; ---- opening sessions ------------------------------------------------------------------------
+
+(defn- open-profile (m name)
+  "This project's most recent session under profile `name`, selected; or a new one started
+under it — the profile the project defines by that name, else the built-in one."
+  (let ([root profiles told] (profiles-here m)
+        live (seq/filter (live-sessions told root)
+               (fn (session) (= (map/get-in session [:profile :name]) name))))
+    (if (empty? live) (start-asking told root profiles name) (select-session told (last live)))))
+
+(defcommand cmd-claude
+  (m key)
+  "Claude Code in a bedit chat buffer, for this project: its session, or a new one under the
+`claude` profile. Every tool it has is bedit's. (M-x claude-tui for Claude Code's own
+interface; M-x agent-new for another session.)"
+  (open-profile m "claude"))
+
+(defcommand cmd-claude-tui
+  (m key)
+  "Claude Code's own terminal interface for this project, bedit's tools added: its session, or
+a new one under the `claude-tui` profile. (M-x claude for the chat buffer.)"
+  (open-profile m "claude-tui"))
+
+(defcommand cmd-agent
+  (m key)
+  "Switch to this project's most recent agent session, or start one under the project's
+default profile (`.bedit-agent.blsp`, else `claude`)."
+  (let ([root profiles told] (profiles-here m)
+        live (live-sessions told root))
+    (if (empty? live)
+      (start-asking told root profiles (:default profiles))
+      (select-session told (last live)))))
+
+(defcommand cmd-agent-new
+  (m key)
+  "Start another agent session in this project, under a profile you pick: several can run at
+once, each in its own buffer."
+  (let ([root profiles told] (profiles-here m))
+    (assoc told
+      :minibuffer
+        (ed-name-prompt "Agent profile: "
+          (names profiles)
+          (fn (answered name) (start-asking answered root profiles name))))))
+
+(defcommand cmd-agent-switch
+  (m key)
+  "Switch to any running agent session, in any project."
+  (let (live (seq/filter (vals (sessions m))
+               (fn (session) (ed-buffer-index-by-name m (:buffer session)))))
+    (if (empty? live)
+      (message m "no agent sessions (M-x claude starts one)")
+      (assoc m
+        :minibuffer
+          (ed-name-prompt "Agent session: "
+            (map live :buffer)
+            (fn (answered name)
+              (let (index (ed-buffer-index-by-name answered name))
+                (if index (ed-select answered index) answered))))))))
+
+;; ---- profiles and trust -------------------------------------------------------------------------
+
+(def profile-template
+  ";; Agent profiles for this project (bedit-agent). Data, not code: each is how an agent works
+;; here. M-x agent-new picks one, M-x agent starts the default, M-x claude and claude-tui start
+;; `claude` and `claude-tui` (defined here they override the built-in ones).
+;;
+;; :allow, :allow-commands, :add-dirs, :config-dir, :permission-mode and :claude-tools let an
+;; agent do MORE: they are taken from this file only once you trust the project
+;; (M-x agent-trust-project). Your own ~/.config/bedit/agent-profiles.blsp may always set them.
+{:default \"dev\"
+ :profiles {\"dev\" {:extends \"claude\"
+                   :effort \"high\"
+                   ;; what never asks: :read, :edit, :run
+                   :allow [:read :edit]
+                   :allow-commands [\"nest test\" \"nest check\"]
+                   :instructions \"Run the tests after a change.\"}
+            \"review\" {:extends \"claude\"
+                      :tools [\"read\" \"grep\" \"glob\" \"diagnostics\" \"show\"]
+                      :instructions \"Review only: never edit.\"}
+            \"tui\" {:extends \"claude-tui\"}}}
+")
+
+(defcommand cmd-agent-profiles
+  (m key)
+  "Open this project's agent profiles (`.bedit-agent.blsp` at its root), writing a starting
+one when it has none."
+  (let (file (project-file (project-root m))
+        fresh? (not (file/exists? file)))
+    (when fresh? (file/spit file profile-template))
+    (if fresh?
+      (message (ed-find-file m file)
+        (str "wrote a starting " (path/basename file) " — its profiles show in M-x agent-new"))
+      (ed-find-file m file))))
+
+(defcommand cmd-agent-trust-project
+  (m key)
+  "Trust this project's `.bedit-agent.blsp` to widen what its agents may do (what they may do
+without asking, where, as whom) — or, asked again, stop trusting it. Until then those keys
+in it are left out, and said."
+  (let (root (project-root m)
+        now (not (trusted? root)))
+    (set-trusted root now)
+    (message m
+      (if now
+        (str "agent: "
+          (path/basename root)
+          "'s .bedit-agent.blsp is trusted (for the next session)")
+        (str "agent: " (path/basename root) "'s .bedit-agent.blsp may only narrow again")))))
+
+;; ---- when a session's buffer goes ---------------------------------------------------------------
+
+(defn session-buffer-killed (m killed)
+  "The slot keeper's `:drop` (`model/register-slot-keeper`): a session's buffer being killed
+ends the session — its questions declined, its agent and tool server stopped, its row dropped."
+  (let (buffer (ed-buf-at m killed)
+        session (or (session-of m (:agent-session buffer)) (by-buffer m (buffer-name buffer))))
+    (if (nil? session)
+      m
+      (do
+        (stop-processes session)
+        (drop-session (decline-asks m (:id session)) (:id session))))))
+
+(register-slot-keeper :agent-sessions {:order 15 :drop 'bedit-agent/commands/session-buffer-killed})
+
+(defn running (m)
+  "What C-x C-c asks about: every session whose agent is still at work."
+  (vec (for (session (vals (sessions m)) :when (:busy session)) (str (:buffer session) ": working"))))
+
+(register-exit-query :agent 'bedit-agent/commands/running)
+
+(defn retire-all (m)
+  "The package's `:on-retire` (bedit's `packages/before-retire`): before bedit-agent is removed
+or updated, every session's agent and tool server stopped and its questions declined — what
+no registry can take back. Its buffers stay, to be read; M-x agent-resume goes on with a chat."
+  (fold (vals (sessions m))
+    m
+    (fn (cleaned session)
+      (do
+        (stop-processes session)
+        (drop-session (decline-asks cleaned (:id session)) (:id session))))))

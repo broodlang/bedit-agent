@@ -1,0 +1,176 @@
+;; STARTING a session, either front end: the tool server and the config file naming it first,
+;; then a chat buffer and its headless agent (`chat`), or — once the login is checked off the
+;; loop, in the project's own directory — a terminal running Claude Code's own interface. Before
+;; the first session in a project with more than one Claude account, which one is asked (off
+;; the loop: the account files are read there) and saved for the project.
+
+(defmodule bedit-agent/start
+  "Starting sessions: `start-session` (a resolved profile in a root), `start-asking` (a profile
+by name, the Claude account asked first when the project has none saved), `ask-accounts` (the
+account menu), and the project's profiles and live sessions."
+  (:use editor/buffer :only [buffer-name])
+  (:use model)
+  (:use pool :only [ed-project-root ed-select ed-name-prompt])
+  (:use bedit-agent/profiles)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat :only [open-chat])
+  (:use bedit-agent/accounts :only [discover account label inherit-label])
+  (:use bedit-agent/project-state :only [config-dir-for saved-dir save-dir trusted?])
+  ;; core's terminal defines an M-x `claude` of its own (bare `claude` in a terminal): loaded
+  ;; first, so `commands`' is the one M-x runs — and core's comes back if this package goes
+  (:load terminal))
+
+(defn project-root (m)
+  "The project the selected buffer is in: its root, else the buffer's directory, else bedit's."
+  (or (ed-project-root m) (:dir (ed-current-buf m)) (file/cwd)))
+
+;; ---- starting a session --------------------------------------------------------------------
+
+(defn- start-chat (m session)
+  ;; ready for your first message: Claude Code says nothing until it has one
+  (let (started (assoc session :worker (start-worker session (ed-loop-address)) :status :ready))
+    (open-chat (put-session m started) started)))
+
+(defn- start-tui (m session)
+  ;; the login is checked off the loop, where the session will run; the terminal opens when
+  ;; it answers (`ed-ev-tui-ready`)
+  (let (loop (ed-loop-address)
+        profile (:profile session)
+        command (agentkit/claude-code/interactive-command
+                  (assoc (claude-options session)
+                    ;; the user's own MCP servers stay
+                    :strict-mcp? false
+                    ;; bedit asks about its own tools
+                    :allowed-tools ["mcp__bedit"]
+                    :tools (:claude-tools profile)
+                    :permission-mode (:permission-mode profile))))
+    (spawn (let (status (agentkit/claude-code/auth-status (:config-dir session) nil (:root session))
+                 problem (if (failure? status)
+                           (error-message status)
+                           (agentkit/claude-code/subscription-problem status)))
+             (send loop [:agent-tui-ready (:id session) command problem])))
+    (message (put-session m session) "checking the Claude Code login…")))
+
+(defn ed-ev-tui-ready (m input _textrows _cols _rows)
+  "The login check of a TUI session answered (`[:agent-tui-ready id command problem]`): its
+terminal opened running `command`, or the session refused, saying why."
+  (let ([_ id command problem] input
+        session (session-of m id))
+    (cond
+      (nil? session) m
+      problem
+        (do
+          (stop-processes session)
+          (message (drop-session m id) (str "agent: not started — " problem)))
+      else
+      ;; the label carries the session's own name, so a second TUI session is a second terminal
+        (let (opened (terminal/term-run m
+                       (string/replace (:buffer session) "*" "")
+                       (:root session)
+                       command)
+              buffer (ed-current-buf opened)
+              tagged (ed-set-buf opened (assoc buffer :agent-session id)))
+          (update-session tagged
+            id
+            (fn (current) (assoc current :buffer (buffer-name buffer) :status :ready)))))))
+
+(register-event-handler :agent-tui-ready 'bedit-agent/start/ed-ev-tui-ready)
+
+(defn start-session (m root profile &optional (resumed nil))
+  "`m` with a new session of resolved `profile` started in `root`: its tool server and the
+config file naming it, then its front end (`:chat` or `:tui`). `resumed`, when given, is a past
+session it continues (`project-state/past-sessions`' entry): its Claude session resumed, as
+the account it ran as."
+  (let (id (next-id m)
+        counted (assoc m :agent-session-count (inc (or (:agent-session-count m) 0)))
+        frontend (or (:frontend profile) :chat)
+        session (with-tools {:id id
+                             :root root
+                             :profile profile
+                             :frontend frontend
+                             :buffer (buffer-name-for m root (:name profile))
+                             :config-dir (if resumed
+                                           (:config-dir resumed)
+                                           (config-dir-for root profile))
+                             :claude-session (:claude-session resumed)
+                             :title (:title resumed)
+                             :started (os/now)
+                             :busy false
+                             :status :starting}
+                  (ed-loop-address)))
+    (cond
+      (failure? session) (message m (str "agent: not started — " (error-message session)))
+      (= frontend :tui) (start-tui counted session)
+      else (start-chat counted session))))
+
+(defn start-named (m root profiles name)
+  "Start profile `name` of `profiles` in `root`, or say there is none."
+  (let (profile (resolve profiles name))
+    (if (nil? profile) (message m (str "agent: no profile " name)) (start-session m root profile))))
+
+(defn profiles-here (m)
+  "`[root profiles m']`: the selected buffer's project, its profiles (narrowed unless it is trusted) and
+`m` with any problem with them said."
+  (let (root (project-root m)
+        [profiles problems] (for-project root (trusted? root)))
+    [root profiles (if (empty? problems) m (message m (str "agent: " (first problems))))]))
+
+(defn live-sessions (m root)
+  "`root`'s sessions whose buffer is still there, oldest first."
+  (seq/filter (project-sessions m root)
+    (fn (session) (ed-buffer-index-by-name m (:buffer session)))))
+
+(defn select-session (m session)
+  "Session `session`'s buffer selected, or said to be gone."
+  (let (index (ed-buffer-index-by-name m (:buffer session)))
+    (if index (ed-select m index) (message m (str "agent: " (:buffer session) " is gone")))))
+
+;; ---- which Claude account --------------------------------------------------------------------
+
+(defn ask-accounts (m root purpose)
+  "Read the Claude accounts off the loop, then open the account menu for `root` (`ed-ev-accounts`):
+`purpose` is `{}`, or `{:start name :profiles …}` to start that session once one is chosen."
+  (let (loop (ed-loop-address))
+    (spawn (send loop [:agent-accounts root (vec (map (discover) account)) purpose]))
+    (message m "reading the Claude accounts…")))
+
+(defn start-asking (m root profiles name)
+  "Start profile `name`, asking which Claude account first when `root` has none saved, the
+profile names none, and there is more than one."
+  (let (profile (resolve profiles name))
+    (if (or (nil? profile) (saved-dir root) (:config-dir profile))
+      (start-named m root profiles name)
+      (ask-accounts m root {:start name :profiles profiles}))))
+
+(defn- account-chosen (m root accounts purpose text)
+  ;; the menu's answer saved for `root`, then the session it was asked for started
+  (let (chosen (seq/find accounts (fn (candidate) (= (label candidate) text)))
+        said (message m
+               (str "agent: sessions in "
+                 (path/basename root)
+                 " run as "
+                 (if chosen (label chosen) "bedit's own Claude account")
+                 " (M-x agent-account changes it)")))
+    (save-dir root (if chosen (:dir chosen) :inherit))
+    (if (:start purpose) (start-named said root (:profiles purpose) (:start purpose)) said)))
+
+(defn ed-ev-accounts (m input _textrows _cols _rows)
+  "The Claude accounts read (`[:agent-accounts root accounts purpose]`): the menu, or — for a
+session about to start, with at most one account — the session started without a question."
+  (let ([_ root accounts purpose] input
+        current (saved-dir root))
+    (cond
+      (and (:start purpose) (<= (count accounts) 1))
+        (start-named m root (:profiles purpose) (:start purpose))
+      (empty? accounts) (message m "no Claude accounts found (~/.claude, ~/.claude-*)")
+      else
+        (assoc m
+          :minibuffer
+            (ed-name-prompt (str "Claude account for "
+                              (path/basename root)
+                              (if (string? current) (str " (now " (path/abbreviate current) ")") "")
+                              ": ")
+              (vec (append (map accounts label) [inherit-label]))
+              (fn (answered text) (account-chosen answered root accounts purpose text)))))))
+
+(register-event-handler :agent-accounts 'bedit-agent/start/ed-ev-accounts)

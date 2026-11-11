@@ -1,0 +1,173 @@
+;; The SESSION MENU (C-c C-o in a chat buffer, M-x agent-menu anywhere): a transient that
+;; shows how the session works and changes it. Every entry acts at once and the menu opens
+;; again on the new state, so it reads as a panel of settings rather than a form to submit.
+;;
+;;   Agent: bedit/dev  ·  opus · effort high  ·  ~/.claude-work
+;;
+;;   Without asking                   Model
+;;    e  edit files       [off]        m  model   opus → sonnet → haiku → fable
+;;    r  run commands     [off]        f  effort  low → medium → high → xhigh → max
+;;    c  forget "always" answers (2)
+;;
+;;   Session
+;;    A approvals   i interrupt   k end   n new session   s switch   a account   p profiles   R resume
+;;
+;; The settings are the SESSION's — its profile as it is now — not the menu's: a transient's
+;; switches are remembered per menu across every session, and these belong to one. A changed
+;; model or effort is applied at your next message (the agent restarted, the conversation
+;; resumed: `sessions/restart-worker`), never in the middle of a turn. A permission change
+;; applies to the very next tool call: the loop decides each call against the profile as it
+;; stands (`bridge`).
+
+(defmodule bedit-agent/menu
+  "The agent session menu: `cmd-agent-menu` opens it on the selected session; its entries are
+commands that change the session and open the menu again."
+  (:use model)
+  (:use interactive)
+  (:use transient :only [ed-transient-open])
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat :only [current-session]))
+
+(def models ["opus" "sonnet" "haiku" "fable"])
+
+(def efforts ["low" "medium" "high" "xhigh" "max"])
+
+(defn next-in (choices current)
+  "The choice after `current` in `choices`, wrapping; the first when `current` is not one.
+
+    (bedit-agent/menu/next-in [\"a\" \"b\"] \"b\")   ;=> \"a\"
+    (bedit-agent/menu/next-in [\"a\" \"b\"] nil)   ;=> \"a\""
+  (let (at (index-of choices current))
+    (nth choices (if (< at 0) 0 (math/mod (inc at) (count choices))))))
+
+(defn- on-off (on?) (if on? "[on] " "[off]"))
+
+(defn- allows? (session risk) (includes? (or (map/get-in session [:profile :allow]) [:read]) risk))
+
+(defn spec (session)
+  "The menu for `session`, its labels showing the session as it is now."
+  (let (profile (:profile session)
+        always (let (answers (or (:always session) {}))
+                 (+ (count (or (:tools answers) #{})) (count (or (:commands answers) #{})))))
+    {:name 'agent-session
+     :title (str "Agent: "
+              (:buffer session)
+              "  ·  "
+              (or (:model profile) "default model")
+              (if (:effort profile) (str " · effort " (:effort profile)) "")
+              (if (:config-dir session) (str "  ·  " (path/abbreviate (:config-dir session))) "")
+              (if (:restart-pending session) "  ·  applied at your next message" ""))
+     :groups [{:title "Without asking"
+               :suffixes [{:key "e"
+                           :kind :command
+                           :command 'bedit-agent/menu/cmd-agent-toggle-edits
+                           :label (str (on-off (allows? session :edit)) " edit files")}
+                           {:key "r"
+                            :kind :command
+                            :command 'bedit-agent/menu/cmd-agent-toggle-commands
+                            :label (str (on-off (allows? session :run)) " run commands")}
+                           {:key "c"
+                            :kind :command
+                            :command 'bedit-agent/menu/cmd-agent-forget-always
+                            :label (str "forget \"always\" answers (" always ")")}]}
+               {:title "Model"
+                :suffixes [{:key "m"
+                            :kind :command
+                            :command 'bedit-agent/menu/cmd-agent-next-model
+                            :label (str "model   " (or (:model profile) "default"))}
+                            {:key "f"
+                             :kind :command
+                             :command 'bedit-agent/menu/cmd-agent-next-effort
+                             :label (str "effort  " (or (:effort profile) "default"))}]}
+               {:title "Session"
+                :suffixes [{:key "A"
+                            :kind :command
+                            :command 'bedit-agent/permission/cmd-agent-approvals
+                            :label "approvals"}
+                            {:key "i"
+                             :kind :command
+                             :command 'bedit-agent/chat/cmd-agent-interrupt
+                             :label "interrupt"}
+                            {:key "k"
+                             :kind :command
+                             :command 'bedit-agent/chat/cmd-agent-end
+                             :label "end"}
+                            {:key "n"
+                             :kind :command
+                             :command 'bedit-agent/commands/cmd-agent-new
+                             :label "new session"}
+                            {:key "s"
+                             :kind :command
+                             :command 'bedit-agent/commands/cmd-agent-switch
+                             :label "switch"}
+                            {:key "a"
+                             :kind :command
+                             :command 'bedit-agent/commands/cmd-agent-account
+                             :label "account"}
+                            {:key "p"
+                             :kind :command
+                             :command 'bedit-agent/commands/cmd-agent-profiles
+                             :label "profiles"}
+                            {:key "R"
+                             :kind :command
+                             :command 'bedit-agent/resume/cmd-agent-resume
+                             :label "resume an earlier chat"}]}]}))
+
+(defn- with-session (m f)
+  ;; `(f session)`'s new session stored and the menu opened again on it; said when the selected
+  ;; buffer is no session's
+  (let (session (current-session m))
+    (if (nil? session)
+      (message m "not in an agent session (M-x agent starts one)")
+      (let (changed (f session)) (ed-transient-open (put-session m changed) (spec changed))))))
+
+(defn- toggle-risk (session risk)
+  (let (allow (or (map/get-in session [:profile :allow]) [:read]))
+    (map/assoc-in session
+      [:profile :allow]
+      (if (includes? allow risk)
+        (vec (seq/reject allow (fn (allowed) (= allowed risk))))
+        (conj allow risk)))))
+
+(defn- change-setting (session key value)
+  ;; a model or effort change: the agent restarts at the next message (a TUI session's own
+  ;; interface has /model for that, so only a chat session is restarted)
+  (assoc (map/assoc-in session [:profile key] value) :restart-pending (= (:frontend session) :chat)))
+
+(defcommand cmd-agent-menu
+  (m key)
+  "The session menu (C-c C-o in a chat buffer): what the agent may do without asking, its model
+and effort, and the session's commands."
+  (let (session (current-session m))
+    (if (nil? session)
+      (message m "not in an agent session (M-x agent starts one)")
+      (ed-transient-open m (spec session)))))
+
+(defcommand cmd-agent-toggle-edits
+  (m key)
+  "Let this session's agent edit files without asking, or stop letting it."
+  (with-session m (fn (session) (toggle-risk session :edit))))
+
+(defcommand cmd-agent-toggle-commands
+  (m key)
+  "Let this session's agent run commands without asking, or stop letting it."
+  (with-session m (fn (session) (toggle-risk session :run))))
+
+(defcommand cmd-agent-forget-always
+  (m key)
+  "Forget the tools you answered `a` (always) for in this session: they ask again."
+  (with-session m (fn (session) (assoc session :always {}))))
+
+(defcommand cmd-agent-next-model
+  (m key)
+  "This session's next model (opus, sonnet, haiku, fable), from your next message on."
+  (with-session m
+    (fn (session)
+      (change-setting session :model (next-in models (map/get-in session [:profile :model]))))))
+
+(defcommand cmd-agent-next-effort
+  (m key)
+  "This session's next reasoning effort (low … max), from your next message on."
+  (with-session m
+    (fn (session)
+      (change-setting session :effort (next-in efforts (map/get-in session [:profile :effort]))))))

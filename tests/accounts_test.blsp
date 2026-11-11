@@ -1,0 +1,71 @@
+(defmodule accounts-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/accounts)
+  (:use bedit-agent/project-state)
+  (:use bedit-agent/start :only [ed-ev-accounts]))
+
+(defn at-home ()
+  "A scratch home with three Claude config dirs (one without a login) and the default one's
+account file beside it, as Claude Code lays them out."
+  (let (home (path/join (or (test/scratch-dir) "/tmp") (str "accounts-" (rand/token 6))))
+    (doseq (name [".claude" ".claude-work" ".claude-personal" ".claude-empty"])
+      (file/mkdir (path/join home name)))
+    (doseq (name [".claude" ".claude-work" ".claude-personal"])
+      (file/spit (path/join home name ".credentials.json") "{}"))
+    (file/spit (path/join home ".claude.json")
+      "{\"numStartups\":3,\"oauthAccount\":{\"emailAddress\":\"me@home.org\",\"organizationName\":\"Home\"}}")
+    (file/spit (path/join home ".claude-work" ".claude.json")
+      "{\"oauthAccount\":{\"organizationName\":\"Work Inc\",\"emailAddress\":\"me@work.com\"}}")
+    home))
+
+(describe "Claude accounts"
+  (test "the config dirs with a login are found, ~/.claude first"
+    (let (home (at-home))
+      (assert= (into [] (map (discover home) path/basename))
+        [".claude" ".claude-personal" ".claude-work"])))
+  (test "each is labelled with its account; the default dir's file is beside it"
+    (let (home (at-home))
+      (assert= (:email (account (path/join home ".claude"))) "me@home.org")
+      (assert= (:org (account (path/join home ".claude-work"))) "Work Inc")
+      (is (nil? (:email (account (path/join home ".claude-personal")))))
+      (is (includes? (label (account (path/join home ".claude-work"))) "me@work.com · Work Inc"))))
+  (test "the choice is saved per project, and wins over the profile's"
+    (binding (bedit-agent/project-state/*state-file* (path/join (at-home) "agent-projects.blsp"))
+      (is (nil? (saved-dir "/src/a")))
+      (assert= (config-dir-for "/src/a" {:config-dir "/from/profile"}) "/from/profile")
+      (save-dir "/src/a" "/home/me/.claude-work")
+      (save-dir "/src/b" :inherit)
+      (assert= (saved-dir "/src/a") "/home/me/.claude-work")
+      (assert= (config-dir-for "/src/a" {:config-dir "/from/profile"}) "/home/me/.claude-work")
+      ;; chosen to be bedit's own: neither the profile's nor any other
+      (is (nil? (config-dir-for "/src/b" {:config-dir "/from/profile"})))
+      (is (nil? (saved-dir "/src/c")))
+      (save-dir "/src/a" nil)
+      (is (nil? (saved-dir "/src/a"))))))
+
+(describe "the account menu"
+  (test "lists every account and bedit's own; a choice is saved for the project"
+    (binding (bedit-agent/project-state/*state-file* (path/join (at-home) "agent-projects.blsp"))
+      (let (home (at-home)
+            accounts (vec (map (discover home) account))
+            m (ed-ev-accounts (ed-init (make-buffer ""))
+                [:agent-accounts "/src/p" accounts {}]
+                nil
+                80
+                24)
+            menu (:minibuffer m))
+        (is (map? menu))
+        (let (chosen (label (nth accounts 2))
+              answered ((:on-complete menu) (dissoc m :minibuffer) chosen))
+          (assert= (saved-dir "/src/p") (path/join home ".claude-work"))
+          (is (includes? (:echo answered) "me@work.com"))))))
+  (test "a session about to start with one account asks nothing"
+    (let (m (ed-ev-accounts (ed-init (make-buffer ""))
+              [:agent-accounts "/src/p" [] {:start "nope" :profiles {:profiles {}}}]
+              nil
+              80
+              24))
+      (is (nil? (:minibuffer m)))
+      (is (includes? (:echo m) "no profile nope")))))

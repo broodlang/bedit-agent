@@ -1,0 +1,460 @@
+;; What the review of both front ends asked for, pinned: permission questions that cannot be
+;; answered by accident, sessions that take their questions and processes with them, edits that
+;; refuse what they should, and what the agent changed shown back to you.
+
+(defmodule review-test
+  (:use test)
+  (:use model)
+  (:use pool :only [ed-find-file])
+  (:use editor/buffer)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/bridge)
+  (:use bedit-agent/chat :only [open-chat])
+  (:use bedit-agent/transcript :only [write-ran])
+  (:use bedit-agent/permission)
+  (:use bedit-agent/diffs :only [diff-spans]))
+
+(defn rt-setup (&optional (profile {:name "dev" :allow [:read]}))
+  "`[model dir file]`: a scratch project with a three-line file and a chat session over it."
+  (let (dir (path/join (or (test/scratch-dir) "/tmp") (str "review-" (rand/token 6)))
+        file (path/join dir "notes.txt")
+        session {:id "a1"
+                 :root dir
+                 :profile profile
+                 :frontend :chat
+                 :worker nil
+                 :buffer "*agent: x/dev*"})
+    (file/mkdir dir)
+    (file/spit file "one\ntwo\nthree\n")
+    [(open-chat (put-session (ed-init (make-buffer "")) session) session) dir file]))
+
+(defn rt-ask (m request)
+  "`[model' result]`: `request` put to the loop, and what it answered (`:no-reply` if nothing)."
+  (let (tag (ref)
+        next (ed-ev-agent-tool m [:agent-tool request (self) tag] nil 80 24))
+    [next (receive ([:agent-tool-reply ^tag result] result) (after 300 :no-reply))]))
+
+(defn rt-permission (m request)
+  "`[model' tag]`: a permission request put to the loop; its answer comes later."
+  (let (tag (ref))
+    [(ed-ev-agent-tool m
+       [:agent-tool (assoc request :op :permission :session "a1") (self) tag]
+       nil
+       80
+       24)
+      tag]))
+
+(defn rt-answer (tag)
+  (receive ([:agent-tool-reply ^tag result] (:output result)) (after 300 :none)))
+
+(defn rt-first-ask (m) (:id (first (:agent-asks m))))
+
+(describe "permission requests"
+  (test "a read inside the project is free; outside it asks, whatever the profile allows"
+    (let ([m dir _file] (rt-setup))
+      (let ([inside tag] (rt-permission m
+                           {:tool "read" :risk :read :paths [(path/join dir "a")] :what "read a"}))
+        (assert= (rt-answer tag) "allow")
+        (assert= (count (or (:agent-asks inside) [])) 0))
+      (let ([outside tag] (rt-permission m
+                            {:tool "read"
+                             :risk :read
+                             :paths ["/etc/passwd"]
+                             :what "read /etc/passwd"})
+            index (or (ed-buffer-index-by-name outside "*agent: approvals*") -1))
+        (assert= (rt-answer tag) :none)
+        (assert= (count (:agent-asks outside)) 1)
+        (is (includes? (buffer-text (ed-buf-at outside index)) "(outside the project)")))))
+  (test "no key typed anywhere else answers it: it waits in its buffer, the selection left put"
+    (let ([m _dir _file] (rt-setup)
+          before (buffer-name (ed-current-buf m))
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (assert= (buffer-name (ed-current-buf queued)) before)
+      (is (nil? (:read-char queued)))
+      (assert= (rt-answer tag) :none)))
+  (test "always for bash is that command, not every command"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m
+                         {:tool "bash" :risk :run :command "nest test" :what "bash: nest test"})
+          answered (answer queued (rt-first-ask queued) :always))
+      (assert= (rt-answer tag) "allow")
+      (let ([_same tag2] (rt-permission answered
+                           {:tool "bash" :risk :run :command "nest test" :what "x"}))
+        (assert= (rt-answer tag2) "allow"))
+      (let ([other tag3] (rt-permission answered
+                           {:tool "bash" :risk :run :command "rm -rf x" :what "x"}))
+        (assert= (rt-answer tag3) :none)
+        (assert= (count (:agent-asks other)) 1))))
+  (test "ending a session declines what it has waiting"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          [twice tag2] (rt-permission queued {:tool "edit" :risk :edit :what "edit x"})
+          ended (decline-asks twice "a1"))
+      (assert= (rt-answer tag) "deny")
+      (assert= (rt-answer tag2) "deny")
+      (assert= (:agent-asks ended) [])))
+  (test "a session's profile, as changed now, decides the next call"
+    (let ([m _dir _file] (rt-setup)
+          widened (update-session m
+                    "a1"
+                    (fn (session) (map/assoc-in session [:profile :allow] [:read :run])))
+          [_ tag] (rt-permission widened {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (assert= (rt-answer tag) "allow"))))
+
+(describe "edits"
+  (test "the selection stays where it was, and the edit is one undo step"
+    (let ([m _dir file] (rt-setup)
+          before (buffer-name (ed-current-buf m))
+          [next result] (rt-ask m {:op :edit :session "a1" :path file :old "two" :new "TWO"}))
+      (is (:ok? result))
+      (assert= (buffer-name (ed-current-buf next)) before)))
+  (test "a read-only buffer, a directory and your unsaved changes are refused"
+    (let ([m dir file] (rt-setup)
+          opened (ed-find-file m file)
+          locked (ed-set-buf opened (set-read-only (ed-current-buf opened) true)))
+      (is (includes? (:output (second (rt-ask locked
+                                        {:op :edit :session "a1" :path file :old "one" :new "1"})))
+            "read-only"))
+      (is (includes? (:output (second (rt-ask m
+                                        {:op :edit :session "a1" :path dir :old "a" :new "b"})))
+            "directory"))))
+  (test "a file changed on disk is read again before the edit"
+    (let ([m _dir file] (rt-setup)
+          opened (ed-find-file m file))
+      (file/spit file "one\nchanged on disk\nthree\n")
+      ;; the disk is newer than what bedit read
+      (let (stale (ed-set-buf opened (assoc (ed-current-buf opened) :file-mtime 1))
+            [_ result] (rt-ask stale
+                         {:op :edit :session "a1" :path file :old "changed on disk" :new "ok"}))
+        (is (:ok? result))
+        (assert= (file/slurp file) "one\nok\nthree\n"))))
+  (test "a write makes the directories it needs"
+    (let ([m dir _file] (rt-setup)
+          deep (path/join dir "a" "b" "c.txt")
+          [_ result] (rt-ask m {:op :write :session "a1" :path deep :content "hi\n"}))
+      (is (:ok? result))
+      (assert= (file/slurp deep) "hi\n")))
+  (test "a request that fails still answers"
+    (let ([m _dir _file] (rt-setup))
+      (is (not (:ok? (second (rt-ask m {:op :nonsense}))))))))
+
+(describe "what the agent changed"
+  (test "show_changes diffs against the text before the agent's first edit"
+    (let ([m _dir file] (rt-setup)
+          [edited _] (rt-ask m {:op :edit :session "a1" :path file :old "two" :new "TWO"})
+          [again _] (rt-ask edited {:op :edit :session "a1" :path file :old "three" :new "THREE"})
+          [shown result] (rt-ask again {:op :changes :session "a1"}))
+      (is (:ok? result))
+      (assert= (:summary result) "1 file changed")
+      (is (includes? (:output result) "-two"))
+      (is (includes? (:output result) "+THREE"))
+      (is (any? (:buffers shown)
+            (fn (buffer) (string/ends-with? (buffer-name buffer) "/dev changes*"))))))
+  (test "nothing changed says so"
+    (let ([m _dir _file] (rt-setup))
+      (assert= (:summary (second (rt-ask m {:op :changes :session "a1"}))) "no changes")))
+  (test "a diff is coloured by line"
+    (assert= (diff-spans "-a\n+b") [[0 2 :syntax/error] [3 5 :syntax/string]])))
+
+(describe "the transcript"
+  (test "a call's details land under its own row, whatever order calls finish in"
+    (let ([m _dir _file] (rt-setup)
+          worker (self)
+          live (update-session m "a1" (fn (session) (assoc session :worker worker)))
+          event (fn (model kind payload)
+                  (bedit-agent/chat/ed-ev-agent model [:agent worker kind payload] nil 80 24))
+          two (-> live
+                (event :tool-use {:id "t1" :name "mcp__bedit__grep" :input {:pattern "alpha"}})
+                (event :tool-use {:id "t2" :name "mcp__bedit__grep" :input {:pattern "beta"}}))
+          finished (-> two
+                     (ed-chat-write-ran {:tool "grep"
+                                         :arguments {:pattern "beta"}
+                                         :ok? true
+                                         :summary "2 matches"
+                                         :details [["b.txt:1: beta" nil]]})
+                     (ed-chat-write-ran {:tool "grep"
+                                         :arguments {:pattern "alpha"}
+                                         :ok? true
+                                         :summary "1 match"
+                                         :details [["a.txt:3: alpha" nil]]}))
+          text (buffer-text (ed-current-buf finished)))
+      ;; Claude makes both calls before either answers: each call's lines under its own row
+      (is (includes? text
+            (str "  ⏺ grep alpha\n    ⎿ 1 match\n      a.txt:3: alpha\n"
+              "  ⏺ grep beta\n    ⎿ 2 matches\n      b.txt:1: beta\n")))))
+  (test "the transcript is not yours to edit; the input is"
+    (let ([m _dir _file] (rt-setup)
+          buffer (ed-current-buf m))
+      (is (position-read-only? buffer 0))
+      (let (typed (insert buffer "x"))
+        (is (not (position-read-only? typed (:input-start typed)))))))
+  (test "a path:line in the transcript is a link RET follows"
+    (let ([m dir _file] (rt-setup)
+          linked (bedit-agent/transcript/ed-chat-write m
+                   "*agent: x/dev*"
+                   (fn (buffer)
+                     (bedit-agent/transcript/transcript-line buffer "    ⎿ edited notes.txt:2")))
+          buffer (ed-current-buf linked)
+          on-link (ed-set-buf linked
+                    (goto-char buffer (index-of (buffer-text buffer) "notes.txt:2")))
+          visited (bedit-agent/chat/cmd-agent-return on-link :enter))
+      (assert= (buffer-file (ed-current-buf visited)) (path/join dir "notes.txt")))))
+
+(defn ed-chat-write-ran (m ran)
+  (bedit-agent/transcript/ed-chat-write m "*agent: x/dev*" (fn (buffer) (write-ran buffer ran))))
+
+(describe "profiles a project may set"
+  (test "an untrusted project's file may only narrow"
+    (let ([narrowed dropped] (bedit-agent/profiles/narrowed {:profiles {"dev" {:allow [:read
+                                                                                        :edit :run]
+                                                                               :model "opus"
+                                                                               :config-dir "/x"}}}))
+      (assert= (map/get-in narrowed [:profiles "dev"]) {:model "opus"})
+      (assert= (into [] (sort dropped)) ["dev :allow" "dev :config-dir"]))))
+
+(describe "a session's buffer killed"
+  (test "ends the session: its row dropped, its questions declined"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          index (or (ed-buffer-index-by-name queued "*agent: x/dev*") -1)
+          killed (bedit-agent/commands/session-buffer-killed queued index))
+      (is (nil? (session-of killed "a1")))
+      (assert= (rt-answer tag) "deny"))))
+
+(describe "the chip"
+  (test "says what the agent is doing"
+    (let (session {:id "a1" :profile {:name "dev"} :status :ready})
+      (assert= (bedit-agent/chip/chip-text {} session) "✦ dev")
+      (is (includes? (bedit-agent/chip/chip-text {}
+                       (assoc session :busy true :turn-started (os/now)))
+            "working"))
+      (assert= (bedit-agent/chip/chip-text {}
+                 (assoc session
+                   :last-turn {:context {:tokens 41000}}
+                   :limits {"five_hour" {:used 0.62}}))
+        "✦ dev · 41k · 5h 62%")
+      (is (includes? (bedit-agent/chip/chip-text {:agent-asks [{:session "a1"
+                                                                :request {:what "edit x"}}]}
+                       session)
+            "allow? 1 waiting")))))
+
+(describe "a message sent while the agent works"
+  (test "is queued, shown, and sent the moment the turn ends"
+    (let ([m _dir _file] (rt-setup)
+          worker (self)
+          working (update-session m "a1" (fn (session) (assoc session :worker worker :busy true)))
+          typed (ed-set-buf working (insert (ed-current-buf working) "and the docs"))
+          queued (bedit-agent/chat/cmd-agent-return typed :enter))
+      (assert= (receive ([:prompt text] text) (after 100 :nothing)) :nothing)
+      (is (includes? (buffer-text (ed-current-buf queued)) "» and the docs (queued)"))
+      (assert= (:queued (session-of queued "a1")) ["and the docs"])
+      (let (done (bedit-agent/chat/ed-ev-agent queued [:agent worker :turn-done {}] nil 80 24))
+        (assert= (receive ([:prompt text] text) (after 1000 :nothing)) "and the docs")
+        (is (:busy (session-of done "a1")))
+        (assert= (:queued (session-of done "a1")) [])))))
+
+(describe "resuming a chat"
+  (test "a chat is kept for its project once Claude names it, by your first message"
+    (binding (bedit-agent/project-state/*state-file* (path/join (or (test/scratch-dir) "/tmp")
+                                                       (str "state-" (rand/token 6) ".blsp")))
+      (let ([m dir _file] (rt-setup)
+            worker (self)
+            titled (update-session m
+                     "a1"
+                     (fn (session) (assoc session :worker worker :title "fix the tests")))
+            _ready (bedit-agent/chat/ed-ev-agent titled
+                     [:agent worker :ready {:session "c-1" :model "opus"}]
+                     nil
+                     80
+                     24))
+        (assert= (into [] (map (bedit-agent/project-state/past-sessions dir) :claude-session))
+          ["c-1"])
+        (assert= (:title (first (bedit-agent/project-state/past-sessions dir))) "fix the tests"))))
+  (test "a resumed session's history is written as the live one was"
+    (let ([m _dir _file] (rt-setup)
+          shown (bedit-agent/resume/ed-ev-agent-history m
+                  [:agent-history
+                    "a1"
+                    [[:prompt "fix it"]
+                      [:text "On it."]
+                      [:tool-use {:id "t" :name "mcp__bedit__read" :input {:path "a"}}]]]
+                  nil
+                  80
+                  24)
+          text (buffer-text (ed-current-buf shown)))
+      (is (includes? text "» fix it\nOn it.\n  ⏺ read a\n── resumed"))))
+  (test "a past session reads as a person says it"
+    (assert= (bedit-agent/resume/entry-label {:title "fix" :at 0 :profile "dev"} (* 2 86400000))
+      "fix — 2d ago · dev")))
+
+(describe "a TUI session whose Claude Code exited"
+  (test "shows as ended on the chip"
+    (let ([m _dir _file] (rt-setup)
+          tui (update-session m "a1" (fn (session) (assoc session :frontend :tui :status :ready)))
+          index (or (ed-buffer-index-by-name tui "*agent: x/dev*") -1)
+          exited (ed-set-buf-at tui index (assoc (ed-buf-at tui index) :term-exited true)))
+      (is (includes? (bedit-agent/chip/chip-text exited (bedit-agent/chip/chip-session exited))
+            "ended")))))
+
+(describe "the package retired"
+  (test "stops every session and declines what it has waiting"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          retired (bedit-agent/commands/retire-all queued))
+      (assert= (sessions retired) {})
+      (assert= (rt-answer tag) "deny"))))
+
+(describe "the chip paints"
+  (test "in every state, without raising — a raise here breaks every frame of the editor"
+    (let ([m _dir _file] (rt-setup)
+          base (session-of m "a1")
+          states [base
+                   (assoc base :busy true :turn-started (os/now))
+                   (assoc base :status :ended)
+                   (assoc base :status :refused)
+                   (assoc base
+                     :last-turn {:context {:tokens 9000}}
+                     :limits {"five_hour" {:used 0.5}})]
+          asking (assoc m :agent-asks [{:session "a1" :request {:what "edit x"}}]))
+      (doseq (state states)
+        (let (model (put-session m state)
+              segment (bedit-agent/chip/agent-segment model nil nil))
+          (is (string? (:text segment)))
+          (is (map? (:face segment)))
+          (is (vector? ((:tooltip segment) model)))))
+      (is (:bold (:face (bedit-agent/chip/agent-segment asking nil nil)))))))
+
+(describe "feedback that waits for the checker"
+  (test "a file's checking is none, stale or current"
+    (let ([m _dir file] (rt-setup)
+          opened (ed-find-file m file)
+          index (or (ed-buffer-index-by-file opened file) -1)
+          checked (ed-set-buf-at opened
+                    index
+                    (editor/buffer/annotate (ed-buf-at opened index) :diagnostic-lines {}))
+          edited (ed-set-buf-at checked index (insert (ed-buf-at checked index) "x")))
+      (assert= (bedit-agent/workspace/diagnostics-state m file) :none)
+      (assert= (bedit-agent/workspace/diagnostics-state checked file) :current)
+      (assert= (bedit-agent/workspace/diagnostics-state edited file) :stale)))
+  (test "a change waits for the checker to catch up, and no longer than it must"
+    (let (answers (spawn (letrec (serve (fn (left)
+                                          (receive
+                                            ([:agent-tool _ reply-to tag] (send reply-to
+                                                                            [:agent-tool-reply
+                                                                              tag
+                                                                              (agentkit/tool/succeeded (if (> left
+                                                                                                             0)
+                                                                                                         "stale"
+                                                                                                         "current"))])
+                                              (serve (dec left))))))
+                           (serve 2))))
+      (assert= (settled-check answers "a1" "/x") "current")))
+  (test "what the agent is told: problems, none, or to ask again"
+    (let ([m _dir file] (rt-setup)
+          request {:session "a1" :tool "edit" :arguments {:path file} :result {:ok? true}})
+      (is (includes? (bedit-agent/feedback/edit-diagnostics-feedback m
+                       (assoc request :check "stale"))
+            "has not reported"))
+      (is (includes? (bedit-agent/feedback/edit-diagnostics-feedback m
+                       (assoc request :check "current"))
+            "no problems"))
+      (is (nil? (bedit-agent/feedback/edit-diagnostics-feedback m (assoc request :check "none")))))))
+
+(defn rt-panes (m) (editor/pane/pane-count (:layout m)))
+
+(defn rt-shown (m)
+  "The names of the buffers the windows show."
+  (let (layout (:layout m))
+    (vec (map (editor/pane/pane-leaf-paths layout)
+           (fn (path)
+             (buffer-name (ed-buf-at m (:buffer (editor/pane/pane-payload-at layout path)))))))))
+
+(describe "the approvals buffer"
+  (test "an edit is shown as the diff it would make to the file, the lines around it included"
+    (let ([m _dir file] (rt-setup)
+          [queued _tag] (rt-permission m
+                          {:tool "edit"
+                           :risk :edit
+                           :paths [file]
+                           :arguments {:path file :old_string "two" :new_string "TWO"}
+                           :what "edit notes.txt"})
+          text (buffer-text (ed-buf-at queued
+                              (or (ed-buffer-index-by-name queued "*agent: approvals*") 0))))
+      (is (includes? text "/dev — edit notes.txt\n--- a/notes.txt"))
+      (is (includes? text " one\n-two\n+TWO\n three"))
+      (is (includes? text "o the file"))))
+  (test "once nothing waits, the window split off for it goes, the selection left put"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (assert= (rt-panes m) 1)
+      (assert= (rt-panes queued) 2)
+      (let (answered (answer queued (rt-first-ask queued) :allow))
+        (assert= (rt-answer tag) "allow")
+        (assert= (rt-panes answered) 1)
+        (assert= (buffer-name (ed-current-buf answered)) "*agent: x/dev*"))))
+  (test "answered from inside it, the window goes and you are back in a chat"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          inside (cmd-agent-approvals queued nil))
+      (assert= (buffer-name (ed-current-buf inside)) "*agent: approvals*")
+      (let (answered (cmd-agent-allow inside nil))
+        (assert= (rt-answer tag) "allow")
+        (assert= (rt-shown answered) ["*agent: x/dev*"]))))
+  (test "a window it borrowed shows again what it showed"
+    (let ([m _dir file] (rt-setup)
+          split (window-commands/cmd-split-pane-right m nil)
+          two (ed-find-file split file)
+          before (rt-shown two)
+          [queued tag] (rt-permission two {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (is (includes? (rt-shown queued) "*agent: approvals*"))
+      (let (answered (answer queued (rt-first-ask queued) :deny))
+        (assert= (rt-answer tag) "deny")
+        (assert= (rt-shown answered) before))))
+  (test "an answer is written under its own call's row"
+    (let ([m _dir file] (rt-setup)
+          session (session-of m "a1")
+          rows (bedit-agent/transcript/ed-chat-write m
+                 "*agent: x/dev*"
+                 (fn (buffer)
+                   (-> buffer
+                     (bedit-agent/transcript/write-event :tool-use
+                       {:id "t1"
+                        :name "mcp__bedit__edit"
+                        :input {:path file :old_string "two" :new_string "2"}}
+                       session)
+                     (bedit-agent/transcript/write-event :tool-use
+                       {:id "t2" :name "mcp__bedit__bash" :input {:command "ls"}}
+                       session))))
+          [queued _tag] (rt-permission rows
+                          {:tool "edit"
+                           :risk :edit
+                           :paths [file]
+                           :arguments {:path file :old_string "two" :new_string "2"}
+                           :what "edit notes.txt"})
+          answered (answer queued (rt-first-ask queued) :deny))
+      (is (includes? (buffer-text (ed-buf-at answered
+                                    (or (ed-buffer-index-by-name answered "*agent: x/dev*") 0)))
+            "⏺ edit notes.txt\n    ✗ declined\n  ⏺ bash ls")))))
+
+(def rt-fake (path/absolute "../agentkit/tests/fixtures/fake-claude"))
+
+(describe "an ended chat"
+  (test "goes on when you write in it: its tools and agent started again"
+    (binding (agentkit/claude-code/*program* rt-fake
+              bedit-agent/sessions/*config-dir* (path/join (or (test/scratch-dir) "/tmp")
+                                                  (str "cfg-" (rand/token 6))))
+      (let ([m _dir _file] (rt-setup)
+            live (update-session m "a1" (fn (session) (assoc session :worker (self))))
+            ended (bedit-agent/chat/cmd-agent-end live nil))
+        (assert= (receive ([:stop] :stopped) (after 1000 :nothing)) :stopped)
+        (is (nil? (:worker (session-of ended "a1"))))
+        (is (includes? (buffer-text (ed-current-buf ended))
+              "[the session ended — write below to go on with it]"))
+        (let (typed (ed-set-buf ended (insert (ed-current-buf ended) "and then?"))
+              sent (bedit-agent/chat/cmd-agent-return typed nil)
+              session (session-of sent "a1"))
+          (is (pid? (:worker session)))
+          (is (:busy session))
+          (is (includes? (buffer-text (ed-current-buf sent))
+                "── the session goes on ──\n» and then?"))
+          (stop-processes session))))))

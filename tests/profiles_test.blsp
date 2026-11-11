@@ -1,0 +1,45 @@
+(defmodule profiles-test
+  (:use test)
+  (:use bedit-agent/profiles))
+
+(describe "profiles"
+  (test "the built-in profiles are there under no files"
+    (let ([profiles problems] (for-project "/no/such/project"))
+      (assert= problems [])
+      (assert= (:default profiles) "claude")
+      (assert= (:frontend (resolve profiles "claude-tui")) :tui)))
+  (test "a later layer merges over an earlier one, key by key"
+    (let (merged (merge-layers [builtin
+                                 {:default "dev"
+                                  :profiles {"claude" {:model "sonnet"}
+                                             "dev" {:extends "claude" :effort "high"}}}]))
+      (assert= (:default merged) "dev")
+      (assert= (:frontend (resolve merged "claude")) :chat)
+      (assert= (:model (resolve merged "dev")) "sonnet")
+      (assert= (:effort (resolve merged "dev")) "high")
+      (assert= (:name (resolve merged "dev")) "dev")
+      (is (nil? (:extends (resolve merged "dev"))))))
+  (test "an :extends cycle stops"
+    (is (map? (resolve {:profiles {"a" {:extends "b"} "b" {:extends "a"}}} "a"))))
+  (test "a project file is read as data, and a broken one is said"
+    (let (root (path/join (or (test/scratch-dir) "/tmp") (str "profiles-" (rand/token 6)))
+          file (project-file root))
+      (file/mkdir root)
+      (file/spit file "{:default \"x\" :profiles {\"x\" {:extends \"claude\" :model \"haiku\"}}}")
+      (let ([profiles problems] (for-project root))
+        (assert= problems [])
+        (assert= (:model (resolve profiles "x")) "haiku")
+        (assert= (first (names profiles)) "x"))
+      (file/spit file "(this is not a map")
+      (assert= (count (second (for-project root))) 1)))
+  (test "what never asks"
+    (is (allowed? {} :read))
+    (is (not (allowed? {} :edit)))
+    (is (allowed? {:allow [:read :edit :run]} :run)))
+  (test "an allowed command chains nothing"
+    (let (profile {:allow-commands ["nest test" "git status"]})
+      (is (command-allowed? profile "nest test"))
+      (is (command-allowed? profile "git status --short"))
+      (is (not (command-allowed? profile "nest testing")))
+      (is (not (command-allowed? profile "nest test && rm -rf /")))
+      (is (not (command-allowed? profile "nest test $(evil)"))))))

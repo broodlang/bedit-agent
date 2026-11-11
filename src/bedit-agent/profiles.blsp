@@ -1,0 +1,173 @@
+;; A PROFILE is how an agent works in a project: which front end, which model, how much it
+;; may do without asking, what it is told. Profiles are data in three layers, each over the
+;; last: the built-in ones, the user's (`agent-profiles.blsp` in bedit's config dir) and the
+;; project's (`.bedit-agent.blsp` at its root, committed with it, so a team shares them).
+;;
+;;     {:default "dev"
+;;      :profiles {"dev"    {:extends "claude" :effort "high" :allow [:read :edit]}
+;;                 "review" {:model "sonnet" :tools ["read" "grep" "glob" "diagnostics"]
+;;                           :instructions "Review only. Never edit."}
+;;                 "tui"    {:extends "claude-tui"}}}
+;;
+;; A profile's keys:
+;;  :frontend      :chat (bedit's buffer, bedit's tools only) or :tui (the agent's own
+;;                 terminal interface, bedit's tools added)
+;;  :backend       :claude-code (the only one yet)
+;;  :model :effort the agent's model and reasoning effort
+;;  :instructions  appended to the agent's system prompt
+;;  :tools         the bedit tools offered, by name (default: all)
+;;  :allow         the tool risks that never ask: any of :read :edit :run (default [:read])
+;;  :allow-commands command prefixes a `bash` call may run unasked ("nest test")
+;;  :add-dirs      more directories the agent may work in
+;;  :config-dir    another Claude account's directory (CLAUDE_CONFIG_DIR)
+;;  :permission-mode, :claude-tools  the TUI's own (Claude Code's permission mode and tools)
+;;  :extends       a profile this one starts from
+
+(defmodule bedit-agent/profiles
+  "Agent profiles: the built-in ones under the user's and the project's, resolved by name
+(`resolve`), with `:extends` followed."
+  (:use config-paths :only [config-dir]))
+
+(def builtin
+  {:default "claude"
+   :profiles {"claude" {:frontend :chat
+                        :backend :claude-code
+                        :model "opus"
+                        :allow [:read]
+                        :description "Claude Code in a bedit chat buffer; every tool is bedit's"}
+              "claude-tui" {:frontend :tui
+                            :backend :claude-code
+                            :model "opus"
+                            :allow [:read]
+                            :description "Claude Code's own terminal interface, bedit's tools added"}}})
+
+(defn project-file (root)
+  "Where project `root` keeps its profiles.
+
+    (bedit-agent/profiles/project-file \"/src/x\")   ;=> \"/src/x/.bedit-agent.blsp\""
+  (path/join root ".bedit-agent.blsp"))
+
+(defn user-file ()
+  "Where the user keeps profiles every project sees."
+  (path/join (config-dir) "agent-profiles.blsp"))
+
+(defn read-layer (file)
+  "The profiles map in `file` — read as data, never evaluated — or nil when it is missing; a
+failure saying why when it is there and is not a map.
+
+    (bedit-agent/profiles/read-layer \"/no/such/file\")   ;=> nil"
+  (cond
+    (not (file/exists? file)) nil
+    else
+      (let (value (try
+                    (reflect/read-string (file/slurp file))
+                    (catch e (failure (error-message e)))))
+        (cond
+          (failure? value) (failure file ": " (error-message value))
+          (map? value) value
+          else (failure file ": not a map of profiles")))))
+
+(defn merge-layers (layers)
+  "The profiles of `layers`, each over the one before: a profile of the same name merged
+over the earlier one key by key, the last `:default` named winning.
+
+    (:default (bedit-agent/profiles/merge-layers [{:default \"a\"} {:default \"b\"}]))   ;=> \"b\""
+  (fold layers
+    {:default nil :profiles {}}
+    (fn (merged layer)
+      (if (not (map? layer))
+        merged
+        {:default (or (:default layer) (:default merged))
+         :profiles (fold (or (:profiles layer) {})
+                     (:profiles merged)
+                     (fn (profiles [name profile])
+                       (assoc profiles name (merge (or (get profiles name) {}) profile))))}))))
+
+;; What a profile may say only when the person running it said so: each lets an agent do more
+;; than ask (`:allow`, `:allow-commands`, Claude Code's `:permission-mode` and own tools), reach
+;; further (`:add-dirs`) or run as someone else (`:config-dir`). A project's committed file is
+;; written by whoever wrote the repository, so these are taken from it only once you have
+;; trusted the project (M-x agent-trust-project) — as Emacs takes only safe dir-locals.
+(def widening-keys [:allow :allow-commands :add-dirs :config-dir :permission-mode :claude-tools])
+
+(defn narrowed (layer)
+  "`[layer' dropped]`: project `layer` without the [[widening-keys]] in any of its profiles, and
+a line naming each profile and key left out.
+
+    (second (bedit-agent/profiles/narrowed {:profiles {\"dev\" {:allow [:run] :model \"opus\"}}}))   ;=> [\"dev :allow\"]"
+  (if (not (map? layer))
+    [layer []]
+    (fold (or (:profiles layer) {})
+      [(assoc layer :profiles {}) []]
+      (fn (progress [name profile])
+        (let ([kept dropped] progress
+              wide (seq/filter widening-keys (fn (key) (contains? profile key))))
+          [(map/assoc-in kept [:profiles name] (apply dissoc profile wide))
+            (into dropped (map wide (fn (key) (str name " " key))))])))))
+
+(defn for-project (root &optional (trusted? false))
+  "`[profiles problems]` for project `root`: the built-in, user and project layers merged
+([[merge-layers]]) — the project's narrowed ([[narrowed]]) unless `trusted?` — and a line
+for each layer that could not be read and for what an untrusted project's file was not
+allowed to set.
+
+    (count (:profiles (first (bedit-agent/profiles/for-project \"/no/such/root\"))))   ;=> 2"
+  (let (project (if root (read-layer (project-file root)) nil)
+        [taken dropped] (if (or trusted? (failure? project)) [project []] (narrowed project))
+        layers [builtin (read-layer (user-file)) taken]
+        problems (vec (map (seq/filter layers failure?) error-message)))
+    [(merge-layers (seq/reject layers failure?))
+      (if (empty? dropped)
+        problems
+        (conj problems
+          (str ".bedit-agent.blsp asks for "
+            (string/join dropped ", ")
+            ", which a project may set only once you trust it (M-x agent-trust-project)")))]))
+
+;; check-allow: a chain of `:extends` is a few profiles long, and a cycle stops it
+(check-allow :non-tail-recursion
+  (defn- resolve-chain (profiles name seen)
+    (let (profile (get (:profiles profiles) name))
+      (cond
+        (nil? profile) nil
+        (contains? seen name) profile
+        (:extends profile)
+          (merge (or (resolve-chain profiles (:extends profile) (conj seen name)) {})
+            (dissoc profile :extends))
+        else profile))))
+
+(defn resolve (profiles name)
+  "Profile `name` of `profiles` with its `:extends` chain merged under it and `:name` set, or
+nil when there is none. A cycle stops where it repeats.
+
+    (:model (bedit-agent/profiles/resolve {:profiles {\"a\" {:model \"opus\"} \"b\" {:extends \"a\"}}} \"b\"))   ;=> \"opus\""
+  (let (profile (resolve-chain profiles name #{}))
+    (if profile (assoc profile :name name) nil)))
+
+(defn names (profiles)
+  "The profile names, the default first.
+
+    (bedit-agent/profiles/names {:default \"b\" :profiles {\"a\" {} \"b\" {}}})   ;=> [\"b\" \"a\"]"
+  (let (all (sort (keys (:profiles profiles)))
+        default (:default profiles))
+    (if (includes? all default)
+      (vec (cons default (seq/reject all (fn (name) (= name default)))))
+      (vec all))))
+
+(defn allowed? (profile risk)
+  "Whether `profile` lets a tool of `risk` run without asking.
+
+    (bedit-agent/profiles/allowed? {:allow [:read :edit]} :edit)   ;=> true
+    (bedit-agent/profiles/allowed? {} :run)   ;=> false"
+  (includes? (or (:allow profile) [:read]) risk))
+
+(defn command-allowed? (profile command)
+  "Whether `profile` lets shell `command` run unasked: it starts with one of the profile's
+`:allow-commands` and chains nothing after it (no `;`, `&`, `|`, `$`, backtick, redirect).
+
+    (bedit-agent/profiles/command-allowed? {:allow-commands [\"nest test\"]} \"nest test tests/a_test.blsp\")   ;=> true
+    (bedit-agent/profiles/command-allowed? {:allow-commands [\"nest test\"]} \"nest test; rm -rf x\")   ;=> false"
+  (let (trimmed (string/trim command))
+    (and (not (regex/match? "[;&|`$<>(){}\\n\\\\]" trimmed))
+      (any? (or (:allow-commands profile) [])
+        (fn (prefix) (or (= trimmed prefix) (string/starts-with? trimmed (str prefix " "))))))))

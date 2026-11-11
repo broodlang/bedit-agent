@@ -1,0 +1,81 @@
+;; What the editor's side of a tool call needs to know about the session's files, shared by
+;; every part of it: answering the handler that asked (`reply`), a path as the transcript
+;; shows it (`relative`), the buffer bedit has for a file whatever its spelling
+;; (`buffer-index-for`), a file's text as bedit has it (`current-text`), and the problems
+;; bedit shows in it (`diagnostics-of`).
+
+(defmodule bedit-agent/workspace
+  "The project's files as the editor loop sees them, for the tool requests it answers."
+  (:use editor/buffer)
+  (:use model)
+  (:use pool :only [ed-read-file]))
+
+(defn reply (input result)
+  "Send the handler behind tool request `input` (`[:agent-tool request reply-to tag]`) its
+`result`. Every request gets exactly one."
+  (let ([_ _ reply-to tag] input) (send reply-to [:agent-tool-reply tag result])))
+
+(defn relative (session path)
+  "`path` as the transcript shows it: relative to `session`'s project root when it is under it.
+
+    (bedit-agent/workspace/relative {:root \"/src/x\"} \"/src/x/a/b.txt\")   ;=> \"a/b.txt\""
+  (let (root (str (:root session) "/"))
+    (if (and (string? path) (string/starts-with? path root))
+      (string/substring path (string/length root) (string/length path))
+      path)))
+
+(defn buffer-index-for (m path)
+  "The pool index of the buffer visiting `path` — the same file under another spelling (a
+symbolic link, `..`) included — or nil."
+  (or (ed-buffer-index-by-file m path)
+    (let (index (seq/index-where (:buffers m)
+                  (fn (buffer)
+                    (let (file (buffer-file buffer))
+                      (and (string? file) (= (os/canonicalize file) path))))))
+      (if (< index 0) nil index))))
+
+(defn- diagnostic-lines (buffer)
+  ;; a buffer's findings as `file:line: severity message` — and none while they are older
+  ;; than its text: a finding from before an edit is not about the text that is there now
+  (let (held (editor/buffer/annotation buffer :diagnostic-lines)
+        index (if (and held (not (:stale? held))) (:value held) nil))
+    (if (map? index)
+      (for (pair (sort (vec index)) :into [])
+        (let ([line diagnostics] pair)
+          (string/join (map diagnostics
+                         (fn (diagnostic)
+                           (str (or (buffer-file buffer) (buffer-name buffer))
+                             ":"
+                             (inc line)
+                             ": "
+                             (if (:severity diagnostic) (str (:severity diagnostic) " ") "")
+                             (or (:message diagnostic) ""))))
+            "\n")))
+      [])))
+
+(defn diagnostics-of (m path)
+  "What bedit shows for file `path` (or every open buffer when nil), one line each — `[]`
+when nothing, or nothing current."
+  (let (buffers (if path
+                  (let (index (buffer-index-for m path)) (if index [(ed-buf-at m index)] []))
+                  (seq/filter (:buffers m) buffer-file)))
+    (vec (mapcat buffers diagnostic-lines))))
+
+(defn current-text (m path)
+  "`path` as it is now: its buffer's text when bedit has one, else the disk's, else \"\"."
+  (let (index (buffer-index-for m path))
+    (cond
+      index (buffer-text (ed-buf-at m index))
+      (file/exists? path) (or (:text (ed-read-file path)) "")
+      else "")))
+
+(defn diagnostics-state (m path)
+  "Where bedit's checking of file `path` stands: `:none` — no buffer, or nothing has ever
+reported on it (no checker, no language server) — `:stale` while what it shows is older than
+the text, `:current` once a check of this very text has reported."
+  (let (index (buffer-index-for m path)
+        held (if index (editor/buffer/annotation (ed-buf-at m index) :diagnostic-lines) nil))
+    (cond
+      (nil? held) :none
+      (:stale? held) :stale
+      else :current)))

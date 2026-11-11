@@ -1,0 +1,30 @@
+(defmodule bedit-agent
+  "bedit-agent's entry: loading it loads the agent modules, lowest first, which register their
+commands, modes, event handlers and chips with bedit. Its contribution map is empty —
+everything it adds is registered as it loads, so bedit's package manager takes it all back on
+remove. docs/architecture.md has what each module is for."
+  (:load bedit-agent/profiles)
+  (:load bedit-agent/accounts)
+  (:load bedit-agent/project-state)
+  (:load bedit-agent/tools)
+  (:load bedit-agent/sessions)
+  (:load bedit-agent/workspace)
+  (:load bedit-agent/diffs)
+  (:load bedit-agent/transcript)
+  (:load bedit-agent/edits)
+  (:load bedit-agent/permission)
+  (:load bedit-agent/feedback)
+  (:load bedit-agent/bridge)
+  (:load bedit-agent/chat)
+  (:load bedit-agent/start)
+  (:load bedit-agent/commands)
+  (:load bedit-agent/resume)
+  (:load bedit-agent/context)
+  (:load bedit-agent/menu)
+  (:load bedit-agent/chip))
+
+(defn bedit-plugin ()
+  "This package's contribution to bedit: its rows are registered as its modules load, so the
+map holds only what bedit asks for by name — the clean-up it runs before the package is removed
+or updated (`:on-retire`), which stops every session's processes."
+  {:on-retire 'bedit-agent/commands/retire-all})

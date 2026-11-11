@@ -1,0 +1,346 @@
+;; The chat's TRANSCRIPT: writing the conversation into a chat buffer, above the prompt.
+;;
+;;     Claude Code · claude-opus-5-5 · subscription · profile dev
+;;     » make the tests pass
+;;     I'll run them first.
+;;       ⏺ bash nest test
+;;         ⎿ exit 1
+;;       ⏺ edit src/pool.blsp
+;;         ⎿ edited src/pool.blsp:42 (1 replacement)
+;;           - (defn- ed-ensure-file-buffer (m path)
+;;           + (defn ed-ensure-file-buffer (m path)
+;;     ── 41k context · 12s ──
+;;
+;;     ❯ _
+;;
+;; THE TRANSCRIPT IS bedit's. Only the input after the prompt is editable (the buffer is
+;; narrowed to it) and the buffer keeps no undo history — undo restores whole texts, so undoing
+;; your typing would take back what the agent wrote since. A tool call's details are what bedit
+;; knows of it (`feedback`), written under its row whatever order calls finish in (each row
+;; keeps a marker), and a `path:line` in them is a link.
+;;
+;; THE CURSOR STICKS TO THE PROMPT. Every window on the buffer is carried through each insertion
+;; as an Emacs marker is (`ed-chat-write`, over `model/ed-carry-panes`): a window whose cursor
+;; is at the prompt keeps it there; one moved up into the transcript stays on its lines.
+;;
+;; COLOURS. The transcript's own lines carry their faces as a text property (`:agent-face`),
+;; painted under the mode's colouring (`model/register-text-faces`) — theme roles, so a theme
+;; switch recolours them. The agent's own text is Markdown, which the mode colours.
+
+(defmodule bedit-agent/transcript
+  "Writing a chat's transcript: inserting above the prompt (`transcript-insert-at`,
+`transcript-segments`, `transcript-line`), a session event written (`write-event`), a tool
+call's details under its row (`write-ran`), and every window carried (`ed-chat-write`)."
+  (:use editor/buffer)
+  (:use model)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/workspace :only [relative]))
+
+(def prompt "\n❯ ")
+
+;; The text property the transcript's faces ride on.
+(def face-property :agent-face)
+
+;; The most lines of a tool's details (a diff, matches, output) written under its row.
+(def detail-lines 12)
+
+(defn chat-buffer? (buffer)
+  "Whether `buffer` is an agent chat buffer."
+  (= (:type buffer) :agent-chat))
+
+;; ---- writing the transcript ---------------------------------------------------------------
+
+(defn input-only (buffer)
+  "`buffer` narrowed to its input region: the transcript and the prompt are bedit's."
+  (narrow-to buffer [[(or (:input-start buffer) 0) (buffer-length buffer)]]))
+
+(defn transcript-insert-at (buffer at text &optional (face nil))
+  "`buffer` with `text` inserted at `at` — inside or at the end of its transcript — in `face`
+(a theme role) when one is given. The prompt and what is typed after it move along, as do point
+and mark when they were past `at`; markers set there to advance (a tool row's) move too."
+  (let (length (string/length text))
+    (if (= length 0)
+      buffer
+      (let (point (buffer-point buffer)
+            mark (:mark buffer)
+            properties (if face {face-property [[0 length face]]} nil)
+            written (replace-region (widen buffer) at at text properties)
+            shift (fn (position)
+                    (if (and (int? position) (>= position at)) (+ position length) position)))
+        (input-only (assoc (goto-char written (shift point))
+                      :mark (shift mark)
+                      :transcript-end (+ (or (:transcript-end buffer) 0) length)
+                      :input-start (+ (or (:input-start buffer) 0) length)
+                      :insert-lo (math/min at (or (:insert-lo buffer) at))))))))
+
+(defn transcript-insert (buffer text &optional (face nil))
+  "`buffer` with `text` added at the end of its transcript, in `face` when one is given."
+  (transcript-insert-at buffer (or (:transcript-end buffer) 0) text face))
+
+(defn- ends-line? (buffer at:int)
+  ;; whether position `at` starts a line (nothing written yet, or a newline before it)
+  (or (= at 0) (= (string/substring (buffer-text buffer) (dec at) at) "\n")))
+
+(defn transcript-segments (buffer segments fresh? &optional (at nil))
+  "`buffer` with `segments` — `[text face]` pairs, face nil for the mode's own colouring —
+written at `at` (default: the transcript's end); on a line of their own when `fresh?`."
+  (let (from (or at (:transcript-end buffer) 0)
+        lead (if (and fresh? (not (ends-line? buffer from))) [["\n" nil]] [])
+        all (into (into lead segments) (if fresh? [["\n" nil]] [])))
+    (first (fold all
+             [buffer from]
+             (fn (progress [text face])
+               (let ([written position] progress)
+                 [(transcript-insert-at written position text face)
+                   (+ position (string/length text))]))))))
+
+(defn transcript-line (buffer text &optional (face :syntax/comment))
+  "`buffer` with `text` on a line of its own at the end of its transcript, in `face`."
+  (transcript-segments buffer [[text face]] true))
+
+(defn chat-face-spans (buffer)
+  "The faces the transcript laid on its text, where that text is now — the `:agent-chat` text
+face source (`model/register-text-faces`). `[]` for any other buffer."
+  (buffer-properties buffer face-property))
+
+(defn chat-palette ()
+  "The transcript's faces are theme roles already: nothing to resolve them through."
+  nil)
+
+(register-text-faces :agent-chat
+  {:rank 20
+   :spans 'bedit-agent/transcript/chat-face-spans
+   :palette 'bedit-agent/transcript/chat-palette})
+
+(defn shown? (m name)
+  "Whether a window shows the buffer called `name`."
+  (let (index (ed-buffer-index-by-name m name)
+        layout (:layout m))
+    (and index
+      (any? (editor/pane/pane-leaf-paths layout)
+        (fn (path) (= (:buffer (editor/pane/pane-payload-at layout path)) index))))))
+
+(defn ed-chat-write (m name f &optional (size nil))
+  "`m` with chat buffer `name` replaced by `(f buffer)` — which only adds to its transcript —
+and every window on it carried through what was added (`model/ed-carry-panes`): a cursor at
+the prompt stays at the prompt, a window up in the transcript stays on its lines. With the
+window's `size` (`[cols rows]`), a window whose cursor is at the prompt also SCROLLS to keep it
+on screen, as a compile buffer follows its tail ([[follow-prompt]]) — whichever window you are
+in."
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index)
+      m
+      (let (before (ed-buf-at m index)
+            written (f (dissoc before :insert-lo))
+            at (or (:insert-lo written) (:transcript-end before) 0)
+            after (dissoc written :insert-lo)
+            grown (- (buffer-length after) (buffer-length before))
+            stored (ed-set-buf-at m index after))
+        (if (<= grown 0)
+          stored
+          (let (carried (ed-carry-panes stored
+                          index
+                          (buffer-rope before)
+                          (buffer-rope after)
+                          at
+                          at
+                          grown))
+            (if size (follow-prompt carried index (first size) (second size)) carried)))))))
+
+(defn follow-prompt (m index cols rows)
+  "`m` with every window on chat buffer `index` whose cursor is at the prompt scrolled so the
+cursor shows — bedit's own scroll clamp (`scroll/ed-scroll`) run for that window as if it
+were selected, then the selection put back. A window you scrolled up into the transcript is
+left where it is."
+  (let (buffer (ed-buf-at m index)
+        prompt-at (or (:input-start buffer) 0)
+        original (editor/pane/pane-selected-path (:layout m)))
+    (fold (:panes (panes/ed-body-layout m cols rows))
+      m
+      (fn (scrolled pane)
+        (let (point (or (map/get-in pane [:payload :point]) (buffer-point buffer)))
+          (if (and (= (map/get-in pane [:payload :buffer]) index) (>= point prompt-at))
+            (let (selected (assoc scrolled
+                             :layout (editor/pane/pane-select-path (:layout scrolled) (:path pane)))
+                  clamped (scroll/ed-scroll selected (panes/ed-pane-vrows pane buffer)))
+              (assoc clamped :layout (editor/pane/pane-select-path (:layout clamped) original)))
+            scrolled))))))
+
+;; ---- what each event writes ------------------------------------------------------------------
+
+(defn tool-name (name)
+  "A tool as the transcript names it: an MCP server's prefix dropped.
+
+    (bedit-agent/transcript/tool-name \"mcp__bedit__edit\")   ;=> \"edit\""
+  (last (string/split (str name) "__")))
+
+(defn- input-summary (session input)
+  (cond
+    (:command input) (:command input)
+    (:path input)
+      (str (relative session (:path input)) (if (:line input) (str ":" (:line input)) ""))
+    (:pattern input) (:pattern input)
+    else ""))
+
+(defn first-line (text)
+  "The first line of `text`, trimmed, cut at 120 characters.
+
+    (bedit-agent/transcript/first-line \"a\\nb\")   ;=> \"a\""
+  (let (line (or (first (string/split (string/trim (str text)) "\n")) ""))
+    (if (> (string/length line) 120) (str (string/substring line 0 117) "…") line)))
+
+;; A ROW'S MARKER sits at the end of the row's own text, before its newline, and advances: what
+;; is written under the row goes in there as `\nline` (`under-row`), the marker moving past it,
+;; so the next thing for that row lands below. A row written after it (Claude often makes two
+;; calls before either answers) starts after that newline and never moves it.
+
+(defn- under-row (buffer id lines)
+  ;; `buffer` with `lines` — each a vector of `[text face]` segments — written under call `id`'s
+  ;; row, else at the transcript's end
+  (let (marker (if id (buffer-marker buffer [:tool id]) nil)
+        segments (vec (mapcat lines (fn (line) (into [["\n" nil]] line))))
+        end (or (:transcript-end buffer) 0))
+    (cond
+      marker (transcript-segments buffer segments false marker)
+      ;; the end of the transcript's last line, so the lines end the way every line does
+      (and (> end 0) (ends-line? buffer end)) (transcript-segments buffer segments false (dec end))
+      else (transcript-segments buffer (conj segments ["\n" nil]) false end))))
+
+(defn- write-tool-use (buffer payload session)
+  ;; the call's row, its marker, and the call kept as pending until its details arrive
+  ;; (`write-ran`) or the CLI says what it answered (`write-tool-result`)
+  (let (row (transcript-segments buffer
+              [(if (ends-line? buffer (or (:transcript-end buffer) 0)) ["" nil] ["\n" nil])
+                ["  ⏺ " :syntax/punctuation]
+                [(tool-name (:name payload)) :syntax/function]
+                [(str " " (input-summary session (:input payload))) :syntax/string]]
+              false)
+        row-end (:transcript-end row)
+        ;; the newline after the marker is set, or the marker would advance past it
+        written (transcript-insert row "\n"))
+    (assoc (buffer-marker-set written [:tool (:id payload)] row-end true)
+      :agent-pending
+        (conj (or (:agent-pending written) [])
+          {:id (:id payload) :tool (tool-name (:name payload)) :input (:input payload)}))))
+
+(defn- same-call? (pending tool arguments)
+  (and (= (:tool pending) tool)
+    (= (mcp-server/json-data (or (:input pending) {})) (mcp-server/json-data (or arguments {})))))
+
+(defn- detail-lines-of (lines)
+  ;; a tool's detail lines, indented under its row, at most `detail-lines` of them
+  (let (shown (take lines detail-lines)
+        rest-count (- (count lines) (count shown)))
+    (into (vec (map shown (fn ([text face]) [[(str "      " text) face]])))
+      (if (> rest-count 0) [[[(str "      … " rest-count " more lines") :syntax/comment]]] []))))
+
+(defn- pending-call (buffer tool arguments)
+  ;; the pending call of `tool` with `arguments` (its row not yet written under), or nil
+  (seq/find (or (:agent-pending buffer) []) (fn (call) (same-call? call tool arguments))))
+
+(defn- settled (buffer id)
+  ;; `buffer` with call `id` no longer pending
+  (assoc buffer
+    :agent-pending (vec (seq/reject (or (:agent-pending buffer) []) (fn (call) (= (:id call) id))))))
+
+(defn write-under-call (buffer tool arguments segments)
+  "`buffer` with a line of `segments` (`[text face]` pairs) written under the row of the pending
+call of `tool` with `arguments` — what a permission answer says — else at the transcript's
+end. The call stays pending."
+  (let (found (pending-call buffer tool arguments))
+    (under-row buffer (if found (:id found) nil) [segments])))
+
+(defn write-ran (buffer ran)
+  "`buffer` with what bedit knows of a tool call that ran — `ran` is `{:tool :arguments
+:summary :ok? :details}`, `:details` `[[text face] …]` lines — written under the call's row (the
+pending call with that tool and those arguments), which is then no longer pending."
+  (let (found (pending-call buffer (:tool ran) (:arguments ran))
+        head [["    ⎿ " :syntax/punctuation]
+               [(str (if (:ok? ran) "" "✗ ") (:summary ran))
+                 (if (:ok? ran) :syntax/comment :syntax/error)]]
+        written (under-row buffer
+                  (if found (:id found) nil)
+                  (into [head] (detail-lines-of (or (:details ran) [])))))
+    (if found
+      (assoc (settled written (:id found))
+        :agent-detailed (conj (or (:agent-detailed written) #{}) (:id found)))
+      written)))
+
+(defn- write-tool-result (buffer payload)
+  ;; what the CLI says a call answered — written only when bedit wrote nothing for it (a call
+  ;; refused before it ran, a tool that is not bedit's)
+  (if (contains? (or (:agent-detailed buffer) #{}) (:id payload))
+    buffer
+    (settled (under-row buffer
+               (:id payload)
+               [[["    ⎿ " :syntax/punctuation]
+                  (if (:error? payload)
+                    [(str "✗ " (first-line (:output payload))) :syntax/error]
+                    [(first-line (:output payload)) :syntax/comment])]])
+      (:id payload))))
+
+(defn elapsed (session)
+  "How long `session`'s turn has run, as ` · 12s`, or \"\" when none has."
+  (let (started (:turn-started session))
+    (if (int? started) (str " · " (math/round (/ (- (os/now) started) 1000)) "s") "")))
+
+(defn event-text (kind payload session)
+  "What event `kind` with `payload` writes into session `session`'s transcript — `[segments
+fresh-line?]`, `segments` `[text face]` pairs and `fresh-line?` putting them on a line of
+their own — or nil for nothing. (A tool call, a whole text block and a tool's answer have
+writers of their own.)
+
+    (bedit-agent/transcript/event-text :error \"overloaded\" {})   ;=> [[[\"✗ overloaded\" :syntax/error]] true]"
+  (case kind
+    :ready
+      [[[(str "Claude Code · "
+           (:model payload)
+           (if (= (:auth payload) "none") " · subscription" "")
+           " · profile "
+           (map/get-in session [:profile :name])
+           (if (:config-dir session) (str " · " (path/abbreviate (:config-dir session))) ""))
+          :syntax/comment]]
+        true]
+    :text-delta [[[payload nil]] false]
+    :turn-done
+      [[[(str "── "
+           (let (tokens (map/get-in payload [:context :tokens]))
+             (if (int? tokens) (str (math/round (/ tokens 1000)) "k context") "done"))
+           (elapsed session)
+           " ──")
+          :syntax/comment]]
+        true]
+    :error [[[(str "✗ " payload) :syntax/error]] true]
+    :refused [[[(str "✗ not started: " payload) :syntax/error]] true]
+    :exited
+      [[[(str "[the session ended"
+           (if (or (nil? (:code payload)) (= (:code payload) 0)) "" (str ", code " (:code payload)))
+           " — write below to go on with it]")
+          :syntax/comment]]
+        true]
+    nil))
+
+(defn write-event (buffer kind payload session)
+  "`buffer` with event `kind` (`agentkit/events`) with `payload` written into its transcript for
+`session`."
+  (let (streamed? (:agent-streamed buffer)
+        written (case kind
+                  :tool-use (write-tool-use buffer payload session)
+                  :tool-result (write-tool-result buffer payload)
+                  ;; a message the person sent, as a resumed session replays it
+                  :prompt
+                    (transcript-segments buffer
+                      [["» " :syntax/keyword] [payload :syntax/definition]]
+                      true)
+                  ;; a whole text block repeats what streamed in; written only when nothing did
+                  :text (if streamed? buffer (transcript-segments buffer [[payload nil]] true))
+                  (let (entry (event-text kind payload session))
+                    (if (nil? entry)
+                      buffer
+                      (transcript-segments buffer (first entry) (second entry))))))
+    (assoc written
+      :agent-streamed
+        (cond
+          (= kind :text-delta) true
+          (includes? [:text :tool-use :turn-done :prompt] kind) false
+          else streamed?))))

@@ -1,0 +1,209 @@
+;; An agent's EDITS go through bedit: a file is opened (unselected) when bedit has no buffer for
+;; it, changed there by splices — only the text that changes, one undo step, every window on it
+;; carried — and saved on the loop at once, so the agent's next call (a test run, a grep) sees
+;; it. Refused for a buffer that is not plain text, is read-only or holds your unsaved changes;
+;; a file changed on disk since bedit read it (a formatter, a checkout) is read again first.
+;;
+;; WHAT CHANGED is kept: the first time a session changes a file, the text it had goes on the
+;; session (`:originals`, path -> text). `show_changes` diffs against it, so "what did you
+;; change?" is answered with exactly the agent's changes — not yours, not the file's history.
+
+(defmodule bedit-agent/edits
+  "The `edit`, `write`, `show_changes` and `show_diff` requests, answered on the loop:
+`edit-answer`, `write-answer`, `changes-answer`, `display-diff-answer` — each `[m' result]`."
+  (:use editor/buffer)
+  (:use model)
+  (:use pool :only [ed-ensure-file-buffer ed-read-file])
+  (:use file-save :only [ed-save-prepare ed-save-landed])
+  (:use agentkit/tool)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/workspace :only [relative buffer-index-for current-text])
+  (:use bedit-agent/diffs :only [diff-lines show-diff]))
+
+(defn- occurrences (text needle)
+  ;; the offsets of `needle` in `text`, left to right, not overlapping
+  (letrec (scan (fn (from found)
+                  (let (at (index-of text needle from))
+                    (if (< at 0) found (scan (+ at (string/length needle)) (conj found at))))))
+    (scan 0 [])))
+
+(defn- line-of (text offset)
+  ;; the 1-based line `offset` is on
+  (inc (count (seq/filter (string/->list (string/substring text 0 offset)) (fn (c) (= c "\n"))))))
+
+(defn- refusal (buffer path)
+  ;; why the buffer for `path` cannot take an agent's edit, or nil
+  (cond
+    (not (= (buffer-file buffer) path))
+      (str "bedit opened " path " as something other than a text file")
+    (read-only? buffer) (str path " is read-only in bedit")
+    (buffer-modified? buffer)
+      (str path " has unsaved changes in bedit; ask the user to save or revert it first")
+    else nil))
+
+(defn- disk-newer? (buffer path)
+  ;; the file changed on disk since bedit read it (a formatter, a checkout the agent ran)
+  (let (on-disk (file/mtime path)
+        read-at (:file-mtime buffer))
+    (and (int? on-disk) (int? read-at) (> on-disk read-at))))
+
+(defn- save-at (m index path)
+  ;; buffer `index` written to `path` now, on the loop — the agent's next call (a test run, a
+  ;; grep) must see the file as edited — `[m' problem-or-nil]`
+  (let ([prepared-model prepared] (ed-save-prepare m index)
+        content (charset/file-content prepared))
+    (if (failure? content)
+      [prepared-model (error-message content)]
+      (let (written (try
+                      (do
+                        (os/cmd "mkdir" ["-p" (path/dirname path)])
+                        (file/replace path content)
+                        nil)
+                      (catch e (error-message e))))
+        (if written
+          [prepared-model written]
+          [(ed-save-landed prepared-model index (buffer-rope prepared) " (agent)") nil])))))
+
+(defn- splice (m index splices)
+  ;; pool buffer `index` with each `[from to new-text]` of `splices` (any order) made,
+  ;; last first so earlier offsets hold, as one undo step, every window on it carried
+  (fold (reverse (seq/sort-by splices first))
+    m
+    (fn (spliced [from to text]) (splice-one spliced index from to text))))
+
+(defn- splice-one (m index:int from:int to:int text:string)
+  ;; one splice of pool buffer `index`, every window on it carried
+  (let (before (ed-buf-at m index)
+        after (undo-group before (fn (buffer) (replace-region buffer from to text))))
+    (ed-carry-panes (ed-set-buf-at m index after)
+      index
+      (buffer-rope before)
+      (buffer-rope after)
+      from
+      to
+      (string/length text))))
+
+(defn- remember-original (m session path text)
+  ;; `m` with `text` kept as `path`'s text before session `session` first changed it
+  (if (or (nil? session) (contains? (or (:originals (session-of m (:id session))) {}) path))
+    m
+    (update-session m
+      (:id session)
+      (fn (current) (assoc current :originals (assoc (or (:originals current) {}) path text))))))
+
+(defn changes-answer (m request)
+  ;; what session `:session` changed — in `:path`, or every file it touched — shown and told
+  (let (session (session-of m (:session request))
+        originals (or (:originals session) {})
+        paths (if (:path request)
+                (if (contains? originals (:path request)) [(:path request)] [])
+                (sort (keys originals)))
+        diffs (seq/keep paths
+                (fn (path)
+                  (let (label (relative session path)
+                        diff (diff/unified (get originals path)
+                               (current-text m path)
+                               {:from-label (str "a/" label) :to-label (str "b/" label)}))
+                    (if (= diff "") nil diff))))
+        text (string/join diffs "\n"))
+    (cond
+      (nil? session) [m (failed "no such session")]
+      (empty? diffs)
+        [m
+          (succeeded (if (:path request)
+                       "no changes of yours in that file this session"
+                       "no changes this session")
+            "no changes")]
+      else
+        [(show-diff m (str (title session) " changes") text)
+          (succeeded (str "shown to the user:\n" (bedit-agent/tools/clip text))
+            (str (count diffs) (if (= (count diffs) 1) " file changed" " files changed")))])))
+
+(defn display-diff-answer (m request)
+  ;; a diff the handler computed (git's) shown to the user
+  (if (string/blank? (or (:text request) ""))
+    [m (succeeded "no differences" "no differences")]
+    [(show-diff m (:title request) (:text request))
+      (succeeded (str "shown to the user:\n" (bedit-agent/tools/clip (:text request))) "shown")]))
+
+(defn- change-file (m session path plan)
+  "`[m' result]`: `plan` — `(text) -> {:splices :summary-line :details}` or a failed result —
+made to the buffer of file `path` (opened, unselected, when bedit has none) and saved. The
+selection and every window stay where they are. Refused for a buffer that is not plain text,
+is read-only, or holds your unsaved changes; a file changed on disk since bedit read it is
+read again first."
+  (let ([opened index] (let (open (buffer-index-for m path))
+                         (if open [m open] (ed-ensure-file-buffer m path)))
+        buffer (ed-buf-at opened index)
+        problem (refusal buffer path))
+    (if problem
+      [opened (failed problem)]
+      (let (fresh (if (and (file/exists? path) (disk-newer? buffer path))
+                    (let (read (ed-read-file path))
+                      (if (:text read)
+                        (ed-set-buf-at opened
+                          index
+                          (assoc (replace-region buffer 0 (buffer-length buffer) (:text read))
+                            :file-mtime (file/mtime path)))
+                        opened))
+                    opened)
+            text (buffer-text (ed-buf-at fresh index))
+            planned (plan text))
+        (if (result? planned)
+          [fresh planned]
+          (let ([saved problem] (save-at (splice (remember-original fresh session path text)
+                                           index
+                                           (:splices planned))
+                                  index path)
+                where (str (relative session path) ":" (:line planned)))
+            (if problem
+              [saved (failed (str "edited in bedit but not saved: " problem))]
+              [saved
+                (assoc (succeeded (str (:verb planned) " " where (:note planned "")))
+                  :details (:details planned))])))))))
+
+(defn- edit-plan (request)
+  (fn (text)
+    (let (old (or (:old request) "")
+          new (or (:new request) "")
+          found (occurrences text old))
+      (cond
+        (= old "") (failed "old_string is empty; use write to replace a whole file")
+        (empty? found) (failed (str "old_string is not in " (:path request) "; read it again"))
+        (and (> (count found) 1) (not (:all? request)))
+          (failed (str "old_string occurs "
+                    (count found)
+                    " times in "
+                    (:path request)
+                    "; give more context, or replace_all"))
+        else
+          {:splices (vec (map found (fn (at) [at (+ at (string/length old)) new])))
+           :line (line-of text (first found))
+           :verb "edited"
+           :note (str " (" (count found) (if (= (count found) 1) " replacement)" " replacements)"))
+           :details (diff-lines old new)}))))
+
+(defn- write-plan (request)
+  (fn (text)
+    (let (content (or (:content request) ""))
+      {:splices [[0 (string/length text) content]]
+       :line 1
+       :verb (if (= text "") "wrote" "rewrote")
+       :note (str " (" (count (string/split content "\n")) " lines)")
+       :details (if (= text "")
+                  (vec (map (string/split content "\n")
+                         (fn (line) [(str "+ " line) :syntax/string])))
+                  [])})))
+
+(defn edit-answer (m session request)
+  (let (path (:path request))
+    (cond
+      (file/dir? path) [m (failed (str path " is a directory"))]
+      (and (= (or (:old request) "") "") (not (file/exists? path)))
+        (change-file m session path (write-plan {:content (:new request)}))
+      else (change-file m session path (edit-plan request)))))
+
+(defn write-answer (m session request)
+  (if (file/dir? (:path request))
+    [m (failed (str (:path request) " is a directory"))]
+    (change-file m session (:path request) (write-plan request))))

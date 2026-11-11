@@ -1,0 +1,57 @@
+(defmodule menu-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/chat :only [open-chat])
+  (:use bedit-agent/menu))
+
+(def fake (path/absolute "../agentkit/tests/fixtures/fake-claude"))
+
+(defn mt-model ()
+  (let (s {:id "a1"
+           :root "/tmp/proj"
+           :profile {:name "dev" :model "opus" :allow [:read]}
+           :frontend :chat
+           :worker (self)
+           :claude-session "s-0"
+           :buffer "*agent: proj/dev*"
+           :busy false})
+    (open-chat (put-session (ed-init (make-buffer "")) s) s)))
+
+(defn mt-labels (m)
+  (into [] (mapcat (:groups (:spec (:transient m))) (fn (group) (map (:suffixes group) :label)))))
+
+(describe "the session menu"
+  (test "opens on the session, showing what it may do"
+    (let (m (cmd-agent-menu (mt-model) nil))
+      (is (includes? (mt-labels m) "[off] edit files"))
+      (is (includes? (mt-labels m) "model   opus"))))
+  (test "a toggle changes the session and the menu shows it at once"
+    (let (m (cmd-agent-toggle-edits (mt-model) nil))
+      (assert= (map/get-in (session-of m "a1") [:profile :allow]) [:read :edit])
+      (is (includes? (mt-labels m) "[on]  edit files"))
+      (assert= (map/get-in (session-of (cmd-agent-toggle-edits m nil) "a1") [:profile :allow])
+        [:read])))
+  (test "a new model waits for the next message"
+    (let (m (cmd-agent-next-model (mt-model) nil))
+      (assert= (map/get-in (session-of m "a1") [:profile :model]) "sonnet")
+      (is (:restart-pending (session-of m "a1")))
+      (is (includes? (:title (:spec (:transient m))) "applied at your next message"))))
+  (test "the next message restarts the agent, the conversation resumed"
+    (binding (agentkit/claude-code/*program* fake)
+      (let (changed (dissoc (cmd-agent-next-model (mt-model) nil) :transient)
+            typed (ed-set-buf changed (insert (ed-current-buf changed) "go on"))
+            sent (bedit-agent/chat/cmd-agent-return typed nil)
+            s (session-of sent "a1"))
+        ;; the old worker (this test) was told to stop
+        (assert= (receive ([:stop] :stopped) (after 1000 :nothing)) :stopped)
+        (is (not (= (:worker s) (self))))
+        (is (not (:restart-pending s)))
+        (is (includes? (buffer-text (ed-current-buf sent)) "── now sonnet ──"))
+        (send (:worker s) [:stop]))))
+  (test "outside a session it says so"
+    (is (includes? (:echo (cmd-agent-menu (ed-init (make-buffer "")) nil))
+          "not in an agent session")))
+  (test "next-in wraps"
+    (assert= (next-in models "fable") "opus")))
