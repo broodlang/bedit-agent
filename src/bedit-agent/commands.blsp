@@ -170,9 +170,7 @@ nil when the session has ended, or the buffer is no session's."
       (and (= (:frontend session) :tui) (not (:term-exited buffer))) "Claude Code is running in it"
       else nil)))
 
-;; a bedit without the hook kills without asking
-(when (bound? 'model/register-kill-query)
-  (model/register-kill-query :agent 'bedit-agent/commands/kill-question))
+(register-kill-query :agent 'bedit-agent/commands/kill-question)
 
 (defn running (m)
   "What C-x C-c asks about: every session whose agent is still at work."

@@ -203,6 +203,15 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
       lo
       (string/length (or (:question-text before) "")))))
 
+(defn- question-written (buffer lo:int hi:int text properties)
+  ;; `buffer` widened with `[lo, hi)` — the question there now — replaced by `text`, as PROGRAM
+  ;; OUTPUT when this brood has `replace-program-output` (after 0.51.0): in every snapshot of the
+  ;; undo history, so C-/ of your typing never takes the question out or puts an answered one
+  ;; back. A brood without it gets a recorded edit, which undo can step into.
+  (if (bound? 'editor/buffer/replace-program-output)
+    ((reflect/eval 'editor/buffer/replace-program-output) (widen buffer) lo hi text properties)
+    (replace-region (widen buffer) lo hi text properties)))
+
 (defn- question-replaced (m index:int question size lo:int length:int)
   (let ([text properties] question
         before (ed-buf-at m index)
@@ -210,7 +219,7 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
         inserted (string/length text))
     (if (= text (or (:question-text before) ""))
       m
-      (let (written (replace-region (widen before) lo hi text properties)
+      (let (written (question-written before lo hi text properties)
             carry (fn (position) (ed-carry-position position lo hi inserted))
             after (input-only (assoc (goto-char written (carry (buffer-point before)))
                                 :mark (carry (:mark before))

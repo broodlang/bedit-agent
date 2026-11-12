@@ -405,6 +405,13 @@ else holds the keys ([[chat-ask]])."
 
 (register-post-step :agent-ask {:order 90 :run 'bedit-agent/permission/ask-waiting})
 
+(defn macro-private? (m input)
+  "Whether `input` answers an agent's request asked in the minibuffer, and so is no key for a
+keyboard macro being recorded: replayed, the request is not there and the `y` would be typed."
+  (not (nil? (map/get-in m [:read-char :agent-ask]))))
+
+(register-macro-guard :agent-ask 'bedit-agent/permission/macro-private?)
+
 ;; check-allow: each step is `transcript/ed-chat-question`, whose text replacement the checker
 ;; reads as a bare map; every step hands back the model it was given with one buffer rewritten
 (sig ask-in-chats (model any -> model))

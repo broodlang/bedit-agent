@@ -572,3 +572,16 @@
           again (rt-key (ask-waiting queued) "o"))
       (is (:read-char again))
       (is (not (includes? (:prompt (:read-char again)) "o the file"))))))
+
+(describe "the question and undo"
+  (test "undo takes back your typing, never the question shown or taken away meanwhile"
+    (let ([m _dir _file] (rt-setup)
+          typed (typing/cmd-self-insert m "h")
+          [queued _] (rt-permission typed {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          shown (undo (ed-current-buf queued))
+          answered (answer queued (rt-first-ask queued) :allow)
+          gone (undo (ed-current-buf answered)))
+      (is (includes? (buffer-text (widen shown)) "◆ allow bash"))
+      (is (string/ends-with? (buffer-text (widen shown)) "❯ "))
+      (is (not (includes? (buffer-text (widen gone)) "◆ allow")))
+      (is (string/ends-with? (buffer-text (widen gone)) "❯ ")))))
