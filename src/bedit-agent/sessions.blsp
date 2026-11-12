@@ -21,7 +21,9 @@ agent's process (`start-worker`, `restart-worker`)."
   (:use bedit-agent/profiles :only [allowed? command-allowed?])
   (:use bedit-agent/tools :only [catalogue ask-loop describe-call inside?]))
 
-;; How long a tool call waits for the person to answer its permission question.
+;; How long a request waits in *agent: approvals* for your answer: past it the loop declines it
+;; and takes it out of the buffer (`permission/expire-asks`). The tool call waits a minute longer,
+;; so the loop's decline is the answer it gets.
 (def permission-timeout-ms (* 30 60 1000))
 
 ;; Where a session's MCP config file is written (a private directory); a test binds its own.
@@ -128,7 +130,7 @@ what the agent reads."
                    :paths paths
                    :arguments arguments
                    :what (describe-call tool arguments)}
-                  permission-timeout-ms)
+                  (+ permission-timeout-ms 60000))
           answer (if (:ok? reply) (keyword (:output reply)) :deny))
       (if (= answer :deny)
         (failed (str "the user declined: "

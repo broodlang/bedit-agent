@@ -1,11 +1,17 @@
 ;; PERMISSION. A tool call the session's profile allows — as it is now: the session menu changes
 ;; it — is answered at once; so is one an earlier `a` covers. Anything else, and anything that
-;; reaches outside the project, waits in a queue (`:agent-asks`) shown IN A BUFFER of its own,
-;; `*agent: approvals*` — every request in full: a command whole and wrapped, an edit or a write
-;; as the diff it would make to the file as bedit has it, the project and session it comes from.
-;; The buffer opens beside you when a request arrives, the selection left where it is; the echo
-;; area gets one line, and the chip says how many wait. You answer in that buffer (C-c C-a in a
-;; chat, or a click on the chip, takes you there), the request at point, else the first:
+;; reaches outside the project, waits in a queue (`:agent-asks`).
+;;
+;; A CHAT asks in the MINIBUFFER, one key (`ask-in-minibuffer`), once you are in it with nothing
+;; typed at its prompt; its oldest waiting request is shown between the transcript and the prompt
+;; meanwhile (`question-lines`, written by `transcript/ed-chat-question`) — a command whole, an
+;; edit or a write as the diff it would make. No window opens or closes; the chip says how many
+;; wait.
+;;
+;; Every request, a terminal session's too, is also listed in full IN A BUFFER of its own,
+;; `*agent: approvals*`, with the project and session it comes from. A terminal session's
+;; request opens it beside you, the selection left where it is; C-c C-a in a chat, or a click on
+;; the chip, takes you there. There the request at point, else the first:
 ;;
 ;;   y  allow        n  decline        a  allow from now on — this tool, or for `bash` this
 ;;                                        very command — for the rest of the session
@@ -33,7 +39,7 @@ shown), and the buffer's commands."
   (:use bedit-agent/sessions)
   (:use bedit-agent/workspace :only [reply relative current-text])
   (:use bedit-agent/diffs :only [diff-lines unified-lines])
-  (:use bedit-agent/transcript :only [ed-chat-write write-under-call shown?]))
+  (:use bedit-agent/transcript :only [ed-chat-write ed-chat-question write-under-call shown?]))
 
 ;; The buffer the requests wait in.
 (def approvals-name "*agent: approvals*")
@@ -68,10 +74,12 @@ shown), and the buffer's commands."
     (str (:tool request)
       (if (and path (not (= (:tool request) "bash"))) (str " " (relative session path)) ""))))
 
-(defn permission-request (m input)
+(defn permission-request (m input &optional (size nil))
   "A tool call's permission request (`[:agent-tool {:op :permission …} reply-to tag]`): answered
 at once when the session's profile, as it is now, allows it (or an earlier `a` covers it) and it
-stays inside the project; else queued and shown in `*agent: approvals*`, beside you."
+stays inside the project; else queued — asked above a chat's prompt, where you answer it (no
+window opens), and for a terminal session shown in `*agent: approvals*` beside you. `size` is
+the window's `[cols rows]`, so a chat at its prompt scrolls to show the question."
   (let (request (nth input 1)
         session (session-of m (:session request))
         outside (if session (outside session (or (:paths request) [])) []))
@@ -87,16 +95,30 @@ stays inside the project; else queued and shown in `*agent: approvals*`, beside 
                    :input input
                    :session (:id session)
                    :request request
-                   :outside outside}
+                   :outside outside
+                   :asked (os/now)}
               queued (assoc m
                        :agent-asks (conj (or (:agent-asks m) []) ask)
-                       :agent-ask-count (inc (or (:agent-ask-count m) 0))))
-          (message (show-approvals queued :display)
-            (str (title session)
-              " asks to "
-              (target session request)
-              " — answer in "
-              approvals-name))))))
+                       :agent-ask-count (inc (or (:agent-ask-count m) 0)))
+              chat? (= (:frontend session) :chat))
+          (cond
+            (not chat?)
+              (message (show-approvals queued :display size)
+                (str (title session)
+                  " asks to "
+                  (target session request)
+                  " — answer in "
+                  approvals-name))
+            ;; in its chat the minibuffer asks it (`ask-waiting`, after this event)
+            (= (buffer-name (ed-current-buf m)) (:buffer session))
+              (show-approvals queued :none size)
+            else
+              (message (show-approvals queued :none size)
+                (str (title session)
+                  " asks to "
+                  (target session request)
+                  " — it asks when you are in "
+                  (:buffer session))))))))
 
 ;; ---- the buffer ---------------------------------------------------------------------------------
 
@@ -240,12 +262,142 @@ body and the keys — the faces, and each request's `[first-line last-line id]`.
             :layout
               (window-commands/ed-unside-lone-pane (if back (pane-select-path pruned back) pruned)))))))
 
-(defn show-approvals (m action)
-  "`m` with `*agent: approvals*` written afresh from the queue — `action` `:display` shows it
-beside you (the selection left put), `:none` refreshes it only where it is already shown — and,
-once nothing waits, its window taken away again."
+;; The most lines of a request's body the question above a chat's prompt shows; `o` opens the
+;; file, C-c C-a the whole request.
+(def question-body-lines 20)
+
+(defn session-asks (m session-id)
+  "The requests session `session-id` waits on you for, oldest first."
+  (vec (seq/filter (or (:agent-asks m) []) (fn (ask) (= (:session ask) session-id)))))
+
+(defn question-lines (m session-id)
+  "The question above session `session-id`'s chat prompt, as `[text face]` lines: its oldest
+waiting request — what it would do, where it reaches outside, the change it would make — and
+the keys that answer it. `[]` when nothing waits."
+  (let (theirs (session-asks m session-id)
+        ask (first theirs)
+        session (session-of m session-id))
+    (if (or (nil? ask) (nil? session))
+      []
+      (let (request (:request ask)
+            body (request-body m session ask)
+            shown (take body question-body-lines)
+            hidden (- (count body) (count shown))
+            file? (and (first (or (:paths request) [])) (not (= (:tool request) "bash")))
+            waiting (dec (count theirs)))
+        (vec (append [[(str "◆ allow " (target session request) "?") :syntax/keyword]]
+               (if (empty? (:outside ask))
+                 []
+                 [[(str "  outside the project: " (string/join (:outside ask) ", ")) :syntax/error]])
+               (map shown (fn ([text face]) [(str "  " text) face]))
+               (if (> hidden 0)
+                 [[(str "  … " hidden " more lines" (if file? " (o the file)" "")) :syntax/comment]]
+                 [])
+               [[(str (if (:put-off ask)
+                        "  put off — C-c C-a asks again"
+                        "  asked in the minibuffer — C-g puts it off, C-c C-a asks again")
+                   (if (> waiting 0) (str "   (" waiting " more waiting)") ""))
+                  :syntax/comment]]))))))
+
+;; ---- asking in the minibuffer ------------------------------------------------------------------
+;; A chat's oldest waiting request is ASKED in the minibuffer — a one-key read, Emacs's
+;; read-char-choice — once you are in that chat with nothing typed at its prompt, so a request
+;; never takes a key meant for your message or another buffer. It is asked when it arrives if you
+;; are there, else when you come back (a post-step). C-g puts it off — it waits, shown above the
+;; prompt — until C-c C-a asks it again.
+
+(defn- minibuffer-prompt (m ask)
+  (let (session (session-of m (:session ask))
+        request (:request ask)
+        file? (and (first (or (:paths request) [])) (not (= (:tool request) "bash"))))
+    (str (title session)
+      ": allow "
+      (target session request)
+      (if (empty? (:outside ask)) "" " (outside the project)")
+      "? (y, n, a always"
+      (if file? ", o the file" "")
+      ") ")))
+
+(defn ask-in-minibuffer (m ask)
+  "`m` asking request `ask` in the minibuffer, one key: y allows, n declines, a allows from now
+on, o shows the file; C-g puts it off."
+  (let (asked (ed-read-char m
+                (minibuffer-prompt m ask)
+                (fn (answered key) (minibuffer-answer answered (:id ask) key))))
+    (map/assoc-in asked [:read-char :on-cancel] 'bedit-agent/permission/put-off)))
+
+(defn minibuffer-answer (m ask-id key)
+  "What key `key` does to the request `ask-id` asked in the minibuffer: answers it, shows its
+file, or asks again with the keys that answer."
+  (let (ask (seq/find (or (:agent-asks m) []) (fn (waiting) (= (:id waiting) ask-id))))
+    (cond
+      (nil? ask) m
+      (includes? ["y" "Y"] key) (answer m ask-id :allow)
+      (includes? ["n" "N"] key) (answer m ask-id :deny)
+      (= key "a") (answer m ask-id :always)
+      (= key "o") (visit-request m ask)
+      else
+        (message (ask-in-minibuffer m ask)
+          "y allow · n decline · a always · o the file · C-g later"))))
+
+(defn put-off (m)
+  "C-g on a request asked in the minibuffer: it waits, not asked again until C-c C-a."
+  (let (buffer (ed-current-buf m)
+        session (session-of m (:agent-session buffer))
+        ask (if session (first (session-asks m (:id session))) nil)
+        kept (dissoc m :read-char))
+    (if (nil? ask)
+      kept
+      (message (show-approvals (assoc kept
+                                 :agent-asks
+                                   (vec (map (:agent-asks kept)
+                                          (fn (waiting)
+                                            (if (= (:id waiting) (:id ask))
+                                              (assoc waiting :put-off true)
+                                              waiting)))))
+                 :none)
+        "the request waits — C-c C-a asks it again"))))
+
+(defn- chat-ask (m)
+  ;; the request the selected chat would ask now: its session's oldest, not put off, with nothing
+  ;; typed at its prompt — else nil
+  (let (buffer (ed-current-buf m)
+        session (session-of m (:agent-session buffer))
+        ask (if (and session (= (:frontend session) :chat))
+              (first (session-asks m (:id session)))
+              nil))
+    (if (and ask
+          (not (:put-off ask))
+          (= (buffer-length buffer) (or (:input-start buffer) 0))
+          (>= (buffer-point buffer) (or (:input-start buffer) 0)))
+      ask
+      nil)))
+
+(defn ask-waiting (m)
+  "The post-step that asks: the selected chat's waiting request, in the minibuffer, when nothing
+else holds the keys ([[chat-ask]])."
+  (if (or (empty? (or (:agent-asks m) [])) (not (ed-prompt-free? m)))
+    m
+    (let (ask (chat-ask m)) (if ask (ask-in-minibuffer m ask) m))))
+
+(register-post-step :agent-ask {:order 90 :run 'bedit-agent/permission/ask-waiting})
+
+(defn- ask-in-chats (m size)
+  ;; every chat's question as the queue has it now
+  (fold (vals (sessions m))
+    m
+    (fn (asked session)
+      (if (= (:frontend session) :chat)
+        (ed-chat-question asked (:buffer session) (question-lines asked (:id session)) size)
+        asked))))
+
+(defn show-approvals (m action &optional (size nil))
+  "`m` with the queue shown afresh: each chat's question above its prompt, and
+`*agent: approvals*` — `action` `:display` shows it beside you (the selection left put),
+`:none` refreshes it only where it is already shown — and, once nothing waits, its window taken
+away again. `size`, the window's `[cols rows]`, scrolls a chat at its prompt to its question."
   (let ([text spans blocks] (approvals-text m)
-        shown (ed-display-buffer m
+        shown (ed-display-buffer (ask-in-chats m size)
                 approvals-name
                 text
                 :agent-approvals {:action (if (or (= action :display) (shown? m approvals-name)) :display :none)
@@ -277,7 +429,11 @@ once nothing waits, its window taken away again."
 (defn answer (m ask-id verdict)
   "`m` with request `ask-id` answered `verdict` (`:allow`, `:always` or `:deny`): its tool call
 told, an `:always` remembered for the session, said under the call in its chat, gone from the
-buffer — and the buffer's window taken away once nothing waits."
+buffer, and the buffer's window taken away once nothing waits."
+  (answer-why m ask-id verdict nil))
+
+(defn answer-why (m ask-id verdict why)
+  "[[answer]], the tool call told `why` when it is not nil: a decline nobody typed."
   (let (ask (seq/find (or (:agent-asks m) []) (fn (waiting) (= (:id waiting) ask-id))))
     (if (nil? ask)
       m
@@ -285,15 +441,50 @@ buffer — and the buffer's window taken away once nothing waits."
                         :agent-asks
                           (vec (seq/reject (:agent-asks m) (fn (waiting) (= (:id waiting) ask-id)))))
             remembered (if (= verdict :always) (remember-always rest-asks ask) rest-asks))
-        (reply (:input ask) (succeeded (if (= verdict :deny) "deny" "allow")))
+        (reply (:input ask) (succeeded (if (= verdict :deny) "deny" "allow") (or why "")))
         (show-approvals (note remembered
                           ask
-                          (case verdict
-                            :deny "✗ declined"
-                            :always "✓ allowed (from now on, this session)"
-                            "✓ allowed")
+                          (cond
+                            why (str "✗ " why)
+                            (= verdict :deny) "✗ declined"
+                            (= verdict :always) "✓ allowed (from now on, this session)"
+                            else "✓ allowed")
                           (if (= verdict :deny) :syntax/error :syntax/comment))
           :none)))))
+
+;; ---- a request nobody answers ----------------------------------------------------------------
+;; A request left past `sessions/permission-timeout-ms` is declined by the loop — said under its
+;; call, the agent told nobody answered — so the buffer and the chip never list one whose tool
+;; call has stopped waiting. A beat every ten seconds while any request waits checks.
+
+(defn expire-asks (m)
+  "`m` with every request older than `sessions/permission-timeout-ms` declined, unanswered."
+  (let (now (os/now)
+        stale (seq/filter (or (:agent-asks m) [])
+                (fn (ask) (> (- now (or (:asked ask) now)) permission-timeout-ms)))
+        minutes (math/quot permission-timeout-ms 60000))
+    (if (empty? stale)
+      m
+      (message (fold stale
+                 m
+                 (fn (declined ask)
+                   (answer-why declined
+                     (:id ask)
+                     :deny (str "no answer in " minutes " minutes: declined"))))
+        (str (count stale)
+          (if (= (count stale) 1) " request" " requests")
+          " went unanswered for "
+          minutes
+          " minutes and "
+          (if (= (count stale) 1) "was" "were")
+          " declined")))))
+
+(defn expiry-beat (m)
+  "The expiry check's beat: every ten seconds while a request waits."
+  (if (empty? (or (:agent-asks m) [])) nil {:every 10000}))
+
+(register-timer-client :agent-ask-expiry
+  'bedit-agent/permission/expiry-beat 'bedit-agent/permission/expire-asks)
 
 (defn decline-asks (m session-id)
   "`m` with every request session `session-id` has waiting answered `deny` and dropped: what
@@ -347,8 +538,12 @@ or for `bash` this very command."
   (m key)
   "In *agent: approvals*: the file the request at point is about, in another window — at the
 text an edit would change."
-  (let (ask (ask-at-point m)
-        request (:request ask)
+  (visit-request m (ask-at-point m)))
+
+(defn visit-request (m ask)
+  "`m` with the file request `ask` is about shown in another window, at the text an edit would
+change — or why not."
+  (let (request (:request ask)
         path (first (or (:paths request) [])))
     (cond
       (nil? ask) (message m "nothing is waiting for your answer")
@@ -372,11 +567,26 @@ text an edit would change."
 
 (defcommand cmd-agent-approvals
   (m key)
-  "The requests the agents are waiting on you for, in *agent: approvals* — selected (C-c C-a in
-a chat)."
-  (let (shown (show-approvals m :display)
-        index (ed-buffer-index-by-name shown approvals-name))
-    (if index (pool/ed-pop-to-index shown index) shown)))
+  "C-c C-a in a chat: its waiting request asked again in the minibuffer, put off or not. With
+none waiting there, and as M-x agent-approvals: every request, in *agent: approvals*, selected."
+  (let (buffer (ed-current-buf m)
+        session (session-of m (:agent-session buffer))
+        ask (if (and session (= (:frontend session) :chat))
+              (first (session-asks m (:id session)))
+              nil))
+    (if ask
+      (ask-in-minibuffer (show-approvals (assoc m
+                                           :agent-asks
+                                             (vec (map (:agent-asks m)
+                                                    (fn (waiting)
+                                                      (if (= (:id waiting) (:id ask))
+                                                        (dissoc waiting :put-off)
+                                                        waiting)))))
+                           :none)
+        ask)
+      (let (shown (show-approvals m :display)
+            index (ed-buffer-index-by-name shown approvals-name))
+        (if index (pool/ed-pop-to-index shown index) shown)))))
 
 (def approvals-keymap
   (-> {}

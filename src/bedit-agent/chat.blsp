@@ -246,6 +246,51 @@ anywhere else, the start of the line."
   ;; where the line holding `position` starts — the rope asked, not the whole text
   (text/line->char (buffer-rope buffer) (text/char->line (buffer-rope buffer) position)))
 
+;; ---- the transcript, read as a compile buffer is -------------------------------------------
+;; Up in the transcript nothing is typed and the cursor stays where it is, as in *compilation*:
+;; a letter is refused (the mode's `:read-only-hint` says what works), and n / p go to the next
+;; and previous turn or call — your message (`» `) or a tool row (`  ⏺ `). At the prompt they
+;; type as any key does.
+
+(defn- row-starts (buffer)
+  ;; where each of the transcript's rows starts: your messages and the tool calls
+  (let (text (string/substring (buffer-text buffer) 0 (or (:input-start buffer) 0)))
+    (first (fold (string/split text "\n")
+             [[] 0]
+             (fn (progress line)
+               (let ([starts at] progress)
+                 [(if (or (string/starts-with? line "» ") (string/starts-with? line "  ⏺ "))
+                    (conj starts at)
+                    starts)
+                   (+ at (string/length line) 1)]))))))
+
+(defn- in-transcript? (buffer) (< (buffer-point buffer) (or (:input-start buffer) 0)))
+
+(defn- to-row (m key forward?)
+  ;; n / p: in the transcript, the next (or previous) row; at the prompt, the letter typed
+  (let (buffer (ed-current-buf m))
+    (if (not (in-transcript? buffer))
+      (typing/cmd-self-insert m key)
+      (let (here (line-start-of buffer (buffer-point buffer))
+            starts (row-starts buffer)
+            target (if forward?
+                     (seq/find starts (fn (start) (> start here)))
+                     (last (seq/filter starts (fn (start) (< start here))))))
+        (if (nil? target)
+          (ed-ding m (if forward? "no later turn" "no earlier turn"))
+          (ed-set-buf m (goto-char buffer target)))))))
+
+(defcommand cmd-agent-next-row
+  (m key)
+  "n in an agent chat's transcript: the next turn or tool call (your message, `» `, or a call,
+`⏺`). At the prompt it types an n."
+  (to-row m key true))
+
+(defcommand cmd-agent-previous-row
+  (m key)
+  "p in an agent chat's transcript: the previous turn or tool call. At the prompt it types a p."
+  (to-row m key false))
+
 (defcommand cmd-agent-newline
   (m key)
   "C-j in an agent chat buffer: a new line in your message, without sending it."
@@ -292,6 +337,8 @@ conversation."
     (keymap-bind [:ctrl-c :ctrl-o] 'bedit-agent/menu/cmd-agent-menu)
     (keymap-bind [:ctrl-c :ctrl-a] 'bedit-agent/permission/cmd-agent-approvals)
     (keymap-bind [:ctrl-a] 'bedit-agent/chat/cmd-agent-beginning-of-line)
+    (keymap-bind ["n"] 'bedit-agent/chat/cmd-agent-next-row)
+    (keymap-bind ["p"] 'bedit-agent/chat/cmd-agent-previous-row)
     (keymap-bind [:alt-p] 'comint/cmd-comint-previous-history)
     (keymap-bind [:alt-n] 'comint/cmd-comint-next-history)
     (keymap-bind [:ctrl-r] 'comint/cmd-comint-history-search)))
@@ -305,6 +352,7 @@ conversation."
    ;; a `path:line` in the transcript is a link: the pointer, the hover, RET
    :line-loc 'bedit-agent/chat/chat-line-loc
    :electric-pair false
+   :read-only-hint "the transcript is read-only — n / p move between turns, RET goes to your message"
    ;; no comint boundary guard: the transcript is read-only by narrowing already, and the guard
    ;; reads the whole buffer as a string on every key — typing would slow as the chat grows
    :long-lines :wrap})

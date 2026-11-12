@@ -127,3 +127,80 @@ moved its own has none)."
                             (fn (payload) (assoc payload :top 0 :point 0))))
           more (ct-stream scrolled-up 20))
       (assert= (:top (ct-chat-pane more)) 0))))
+
+(defn ct-rows ()
+  "A chat with two of your messages and a tool call in its transcript, point up at its top."
+  (let (m (-> (ct-model)
+            (ct-event :prompt "first")
+            (ct-event :tool-use {:id "t" :name "mcp__bedit__bash" :input {:command "ls"}})
+            (ct-event :prompt "second")))
+    (ed-set-buf m (goto-char (ed-current-buf m) 0))))
+
+(defn ct-line (m)
+  "The line point is on."
+  (let (buffer (ed-current-buf m)
+        text (buffer-text buffer)
+        at (buffer-point buffer)
+        end (index-of text "\n" at))
+    (string/substring text at (if (< end 0) (string/length text) end))))
+
+(describe "the transcript, read as a compile buffer"
+  (test "n and p go between your messages and the calls"
+    (let (m (ct-rows)
+          one (cmd-agent-next-row m "n")
+          two (cmd-agent-next-row one "n")
+          three (cmd-agent-next-row two "n"))
+      (assert= (ct-line one) "» first")
+      (assert= (ct-line two) "  ⏺ bash ls")
+      (assert= (ct-line three) "» second")
+      (is (:command-failed (cmd-agent-next-row three "n")))
+      (assert= (ct-line (cmd-agent-previous-row three "p")) "  ⏺ bash ls")))
+  (test "a letter typed up in the transcript is refused, and the cursor stays where it is"
+    (let (m (cmd-agent-next-row (ct-rows) "n")
+          at (buffer-point (ed-current-buf m))
+          typed (typing/cmd-self-insert m "x"))
+      (assert= (buffer-point (ed-current-buf typed)) at)
+      (assert= (buffer-text (ed-current-buf typed)) (buffer-text (ed-current-buf m)))))
+  (test "at the prompt n and p are letters"
+    (let (m (ct-model)
+          typed (cmd-agent-previous-row (cmd-agent-next-row m "n") "p"))
+      (is (string/ends-with? (ct-text typed) "❯ np")))))
+
+(describe "killing a session's buffer"
+  (test "asks while its agent works or waits for you; an idle one says nothing"
+    (let (m (ct-model)
+          buffer (ed-current-buf m))
+      (is (nil? (bedit-agent/commands/kill-question m buffer)))
+      (assert= (bedit-agent/commands/kill-question (update-session m
+                                                     "a1"
+                                                     (fn (s) (assoc s :busy true)))
+                 buffer)
+        "its agent is working")
+      (let (asked (pool/cmd-kill-buffer (update-session m "a1" (fn (s) (assoc s :busy true))) nil))
+        (is (includes? (:prompt (:read-char asked)) "its agent is working — kill it anyway?"))))))
+
+(describe "a request nobody answers"
+  (test "is declined after the timeout, said under its call, and leaves the buffer"
+    (let (m (ct-model)
+          tag (ref)
+          queued (bedit-agent/permission/permission-request m
+                   [:agent-tool
+                     {:op :permission
+                      :session "a1"
+                      :tool "bash"
+                      :risk :run
+                      :command "ls"
+                      :what "bash: ls"}
+                     (self)
+                     tag])
+          aged (assoc queued
+                 :agent-asks
+                   (vec (map (:agent-asks queued)
+                          (fn (ask) (assoc ask :asked (- (os/now) (* 31 60 1000)))))))
+          expired (bedit-agent/permission/expire-asks aged))
+      (assert= (receive
+                 ([:agent-tool-reply ^tag result] [(:output result) (:summary result)])
+                 (after 1000 :none))
+        ["deny" "no answer in 30 minutes: declined"])
+      (assert= (:agent-asks expired) [])
+      (is (includes? (:echo expired) "1 request went unanswered for 30 minutes")))))

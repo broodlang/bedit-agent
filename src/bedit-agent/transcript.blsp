@@ -166,6 +166,67 @@ left where it is."
               (assoc clamped :layout (editor/pane/pane-select-path (:layout clamped) original)))
             scrolled))))))
 
+;; ---- the question above the prompt ------------------------------------------------------------
+;; A request waiting for your answer shows between the transcript and the prompt, where you
+;; answer it, as Claude Code's own prompt asks. It starts at `:transcript-end`, so what the
+;; transcript gains goes in above it and moves it down; `:question-text` is what it reads.
+
+(defn- question-text (lines)
+  ;; `[text properties]`: the question's `[text face]` lines, each after a newline, one more after
+  ;; the last (a blank line before the prompt) — `["" nil]` for none
+  (if (empty? lines)
+    ["" nil]
+    (let ([text spans] (fold lines
+                         ["" []]
+                         (fn (built [line face])
+                           (let ([so-far found] built
+                                 at (inc (string/length so-far)))
+                             [(str so-far "\n" line)
+                               (if face (conj found [at (+ at (string/length line)) face]) found)]))))
+      [(str text "\n") {face-property spans}])))
+
+(defn ed-chat-question (m name lines &optional (size nil))
+  "`m` with chat buffer `name`'s question — `lines`, `[text face]` each; none when empty —
+written above its prompt in place of the one there, every window on it carried through the
+change; with the window `size` (`[cols rows]`), one at the prompt scrolled to keep it shown
+([[follow-prompt]]). Unchanged when the question is."
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index) m (asked-at m index (question-text lines) size))))
+
+(defn- asked-at (m index:int question size)
+  ;; `m` with chat `index`'s question — from the transcript's end, as long as its text —
+  ;; replaced by `question`, `[text properties]`
+  (let (before (ed-buf-at m index)
+        lo (or (:transcript-end before) 0))
+    (question-replaced m
+      index
+      question
+      size
+      lo
+      (string/length (or (:question-text before) "")))))
+
+(defn- question-replaced (m index:int question size lo:int length:int)
+  (let ([text properties] question
+        before (ed-buf-at m index)
+        hi (+ lo length)
+        inserted (string/length text))
+    (if (= text (or (:question-text before) ""))
+      m
+      (let (written (replace-region (widen before) lo hi text properties)
+            carry (fn (position) (ed-carry-position position lo hi inserted))
+            after (input-only (assoc (goto-char written (carry (buffer-point before)))
+                                :mark (carry (:mark before))
+                                :input-start (carry (:input-start before))
+                                :question-text text))
+            carried (ed-carry-panes (ed-set-buf-at m index after)
+                      index
+                      (buffer-rope before)
+                      (buffer-rope after)
+                      lo
+                      hi
+                      inserted))
+        (if size (follow-prompt carried index (first size) (second size)) carried)))))
+
 ;; ---- what each event writes ------------------------------------------------------------------
 
 (defn tool-name (name)

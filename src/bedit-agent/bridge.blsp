@@ -85,7 +85,7 @@ from the model, which it may change (an edit, a file shown). Always answered: a 
 fails says why."
   (let (request (nth input 1))
     (if (= (:op request) :permission)
-      (permission-request m input)
+      (permission-request m input [cols rows])
       (let ([next result] (try
                             (answer-request m input request [cols rows])
                             (catch e

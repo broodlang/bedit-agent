@@ -155,6 +155,25 @@ ends the session — its questions declined, its agent and tool server stopped, 
 
 (register-slot-keeper :agent-sessions {:order 15 :drop 'bedit-agent/commands/session-buffer-killed})
 
+(defn kill-question (m buffer)
+  "What C-x k says before killing a session's buffer (`model/register-kill-query`): that its
+agent is working or waits for your answer, or that Claude Code still runs in its terminal —
+nil when the session has ended, or the buffer is no session's."
+  (let (session (or (session-of m (:agent-session buffer)) (by-buffer m (buffer-name buffer)))
+        waiting (if session
+                  (any? (or (:agent-asks m) []) (fn (ask) (= (:session ask) (:id session))))
+                  false))
+    (cond
+      (nil? session) nil
+      waiting "its agent waits for your answer"
+      (:busy session) "its agent is working"
+      (and (= (:frontend session) :tui) (not (:term-exited buffer))) "Claude Code is running in it"
+      else nil)))
+
+;; a bedit without the hook kills without asking
+(when (bound? 'model/register-kill-query)
+  (model/register-kill-query :agent 'bedit-agent/commands/kill-question))
+
 (defn running (m)
   "What C-x C-c asks about: every session whose agent is still at work."
   (vec (for (session (vals (sessions m)) :when (:busy session)) (str (:buffer session) ": working"))))

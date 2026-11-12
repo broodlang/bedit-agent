@@ -1,7 +1,7 @@
 ;; One real Claude Code turn on your SUBSCRIPTION (haiku, a few thousand tokens): the chat front
 ;; end end to end — `start-session`, the tool server, the headless agent — with this script
 ;; standing in for bedit's loop: every event folded into a model as the loop folds it, and a
-;; permission question answered `y`. Prints the transcript as the chat buffer shows it.
+;; permission question answered `y` at the chat's prompt. Prints the transcript as the chat buffer shows it.
 ;;
 ;;   AGENT_LIVE_ROOT=/path/to/a/scratch/project nest run slow-tests/claude_live.blsp
 (defmodule claude-live)
@@ -13,13 +13,18 @@
     (_ m)))
 
 (defn- answer-questions (m)
-  ;; every request waiting in *agent: approvals* answered `y`, as you would there
+  ;; every request waiting answered as you would: asked in the minibuffer (the post-step), `y` —
+  ;; the question above the prompt printed first
   (let (waiting (:agent-asks m))
     (if (empty? (or waiting []))
       m
-      (do
-        (io/puts "REQUEST:" (:what (:request (first waiting))))
-        (answer-questions (bedit-agent/permission/answer m (:id (first waiting)) :allow))))))
+      (let (chat (model/ed-current-buf m)
+            text (editor/buffer/buffer-text (editor/buffer/widen chat))
+            at (index-of text "◆ allow"))
+        (io/puts "QUESTION:" (if (>= at 0) (string/substring text at (string/length text)) "(none shown)"))
+        (let (asked (bedit-agent/permission/ask-waiting m))
+          (io/puts "MINIBUFFER:" (map/get-in asked [:read-char :prompt]))
+          (answer-questions ((map/get-in asked [:read-char :then]) (dissoc asked :read-char) "y")))))))
 
 (defn- run (m deadline)
   (receive
@@ -31,7 +36,7 @@
     (after (math/max 0 (- deadline (os/now))) (do (io/puts "TIMEOUT") m))))
 
 (defn main (& args)
-  (let (root (or (first args) (file/cwd))
+  (let (root (or (os/env "AGENT_LIVE_ROOT") (first args) (file/cwd))
         profile {:name "live" :frontend :chat :model "haiku" :allow [:read]}
         started (binding (editor/ui/*loop* (self))
                   (bedit-agent/start/start-session (model/ed-init (editor/buffer/make-buffer "")) root profile))

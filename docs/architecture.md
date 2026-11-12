@@ -42,7 +42,7 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
 | `diffs` | diff lines and unified diffs, coloured, shown beside you |
 | `transcript` | writing a chat's transcript: inserting above the prompt, events, a call's details under its row, carrying windows |
 | `edits` | `edit` / `write` through buffers (splices, saved on the loop), what changed (`show_changes`, `show_diff`) |
-| `permission` | the question queue: decided at once, or asked after a pause; `y n a d C-g`; declining a session's questions |
+| `permission` | the approvals queue: decided at once, or queued — asked in a chat's minibuffer (`ask-waiting`, the request shown above its prompt) and listed in `*agent: approvals*`, as the diff it would make; `y n a o`; the window taken away once nothing waits; declining a session's requests |
 | `feedback` | `:ran`: the call's details into the transcript; the feedback registry |
 | `bridge` | the one event handler for tool requests; the read-only requests |
 | `chat` | the chat mode: sending (queued behind a turn), the session's events, its commands and keymap |

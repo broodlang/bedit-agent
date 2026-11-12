@@ -362,6 +362,10 @@
 
 (defn rt-panes (m) (editor/pane/pane-count (:layout m)))
 
+(defn rt-key (m key)
+  "`m` with `key` handed to the one-key read it holds."
+  ((map/get-in m [:read-char :then]) (dissoc m :read-char) key))
+
 (defn rt-shown (m)
   "The names of the buffers the windows show."
   (let (layout (:layout m))
@@ -383,31 +387,87 @@
       (is (includes? text "/dev — edit notes.txt\n--- a/notes.txt"))
       (is (includes? text " one\n-two\n+TWO\n three"))
       (is (includes? text "o the file"))))
-  (test "once nothing waits, the window split off for it goes, the selection left put"
-    (let ([m _dir _file] (rt-setup)
-          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
-      (assert= (rt-panes m) 1)
-      (assert= (rt-panes queued) 2)
-      (let (answered (answer queued (rt-first-ask queued) :allow))
+  (test "a chat's request is asked in the minibuffer, shown above the prompt; no window opens"
+    (let ([m _dir file] (rt-setup)
+          [queued tag] (rt-permission m
+                         {:tool "edit"
+                          :risk :edit
+                          :paths [file]
+                          :arguments {:path file :old_string "two" :new_string "TWO"}
+                          :what "edit notes.txt"})
+          text (buffer-text (widen (ed-current-buf queued)))
+          asked (ask-waiting queued))
+      (assert= (rt-panes queued) 1)
+      (is (includes? text "◆ allow edit notes.txt?\n  --- a/notes.txt"))
+      (is (includes? text "asked in the minibuffer"))
+      (is (includes? (:prompt (:read-char asked))
+            "/dev: allow edit notes.txt? (y, n, a always, o the file)"))
+      (let (answered (rt-key asked "y")
+            after (widen (ed-current-buf answered)))
         (assert= (rt-answer tag) "allow")
-        (assert= (rt-panes answered) 1)
-        (assert= (buffer-name (ed-current-buf answered)) "*agent: x/dev*"))))
-  (test "answered from inside it, the window goes and you are back in a chat"
+        (is (not (includes? (buffer-text after) "◆ allow")))
+        (is (string/ends-with? (buffer-text after) "\n❯ "))
+        (assert= (buffer-point after) (buffer-length after)))))
+  (test "another key asks again; nothing is asked while you are writing a message"
     (let ([m _dir _file] (rt-setup)
           [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
-          inside (cmd-agent-approvals queued nil))
+          writing (typing/cmd-self-insert queued "h"))
+      (is (nil? (:read-char (ask-waiting writing))))
+      (let (again (rt-key (ask-waiting queued) "x"))
+        (is (:read-char again))
+        (assert= (count (:agent-asks again)) 1)
+        (assert= (:agent-asks (rt-key again "n")) [])
+        (assert= (rt-answer tag) "deny"))))
+  (test "C-g puts it off until C-c C-a asks it again"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          put (put-off (ask-waiting queued)))
+      (is (nil? (:read-char put)))
+      (is (nil? (:read-char (ask-waiting put))))
+      (is (includes? (buffer-text (widen (ed-current-buf put))) "put off — C-c C-a asks again"))
+      (let (asked (cmd-agent-approvals put nil))
+        (is (:read-char asked))
+        (rt-key asked "a")
+        (assert= (rt-answer tag) "allow"))))
+  (test "two requests: the oldest is shown, the other counted"
+    (let ([m _dir _file] (rt-setup)
+          [one _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          [two _] (rt-permission one {:tool "bash" :risk :run :command "pwd" :what "bash: pwd"})
+          text (buffer-text (widen (ed-current-buf two))))
+      (is (includes? text "$ ls"))
+      (is (not (includes? text "$ pwd")))
+      (is (includes? text "(1 more waiting)"))))
+  (test "the approvals list's window goes once nothing waits, the selection left put"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          elsewhere (pool/ed-select queued 0)
+          here (buffer-name (ed-current-buf elsewhere))
+          listed (cmd-agent-approvals elsewhere nil))
+      (assert= (rt-panes listed) 2)
+      (let (answered (answer listed (rt-first-ask listed) :allow))
+        (assert= (rt-answer tag) "allow")
+        (assert= (rt-panes answered) 1)
+        (assert= (buffer-name (ed-current-buf answered)) here))))
+  (test "answered from inside the list, its window goes"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          elsewhere (pool/ed-select queued 0)
+          here (buffer-name (ed-current-buf elsewhere))
+          inside (cmd-agent-approvals elsewhere nil))
       (assert= (buffer-name (ed-current-buf inside)) "*agent: approvals*")
       (let (answered (cmd-agent-allow inside nil))
         (assert= (rt-answer tag) "allow")
-        (assert= (rt-shown answered) ["*agent: x/dev*"]))))
+        (assert= (rt-shown answered) [here]))))
   (test "a window it borrowed shows again what it showed"
     (let ([m _dir file] (rt-setup)
           split (window-commands/cmd-split-pane-right m nil)
           two (ed-find-file split file)
           before (rt-shown two)
-          [queued tag] (rt-permission two {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
-      (is (includes? (rt-shown queued) "*agent: approvals*"))
-      (let (answered (answer queued (rt-first-ask queued) :deny))
+          [queued tag] (rt-permission two {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          listed (cmd-agent-approvals queued nil))
+      (is (includes? (rt-shown listed) "*agent: approvals*"))
+      (assert= (rt-panes listed) 2)
+      (let (answered (answer listed (rt-first-ask listed) :deny))
         (assert= (rt-answer tag) "deny")
         (assert= (rt-shown answered) before))))
   (test "an answer is written under its own call's row"
