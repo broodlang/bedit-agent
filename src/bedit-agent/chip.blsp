@@ -88,36 +88,56 @@ recent live one in this buffer's project — as its buffer shows it, or nil."
     (includes? [:refused :ended] (:status session)) {:fg *red*}
     else {}))
 
+;; The widest a tooltip line is: a command answered "always" can be hundreds of characters, and
+;; the card runs off the window's edge with it.
+(def- tooltip-width 72)
+
+(defn- clipped (line)
+  (if (> (string/length line) tooltip-width)
+    (str (string/substring line 0 (dec tooltip-width)) "…")
+    line))
+
+(defn- always-lines (always)
+  ;; what you answered "always" to: the tools on one line, then each command on its own, the
+  ;; first three of them
+  (let (tools (vec (sort (or (:tools always) #{})))
+        commands (vec (sort (or (:commands always) #{})))
+        shown (take commands 3))
+    (vec (append (if (empty? tools) [] [(str "always: " (string/join tools ", "))])
+           (map shown (fn (command) (str "always: $ " (first (string/split command "\n")))))
+           (if (> (count commands) 3)
+             [(str "always: … " (- (count commands) 3) " more commands")]
+             [])))))
+
 (defn- tooltip (m session)
+  (vec (map (tooltip-lines m session) clipped)))
+
+(defn- tooltip-lines (m session)
   (let (profile (:profile session)
         always (or (:always session) {}))
-    (vec (seq/keep [(str (title session) " · " (->string (:frontend session)))
-                     (str "model "
-                       (or (:model session) (:model profile) "default")
-                       (if (:effort profile) (str " · effort " (:effort profile)) ""))
-                     (str "account "
-                       (if (:config-dir session)
-                         (path/abbreviate (:config-dir session))
-                         "bedit's own"))
-                     (if (empty? (or (:limits session) {}))
-                       nil
-                       (str "plan "
-                         (string/join (map (vec (:limits session))
-                                        (fn ([window state])
-                                          (str window
-                                            " "
-                                            (math/round (* 100 (or (:used state) 0)))
-                                            "%")))
-                           " · ")))
-                     (if (and (empty? (or (:tools always) #{}))
-                           (empty? (or (:commands always) #{})))
-                       nil
-                       (str "always: "
-                         (string/join (into (vec (or (:tools always) #{}))
-                                        (or (:commands always) #{}))
-                           ", ")))
-                     "click: the session · C-c C-o in it: the session menu"]
-           (fn (line) line)))))
+    (vec (append (seq/keep [(str (title session) " · " (->string (:frontend session)))
+                             (str "model "
+                               (or (:model session) (:model profile) "default")
+                               (if (:effort profile) (str " · effort " (:effort profile)) ""))
+                             (str "account "
+                               (if (:config-dir session)
+                                 (path/abbreviate (:config-dir session))
+                                 "bedit's own"))
+                             (if (empty? (or (:limits session) {}))
+                               nil
+                               (str "plan "
+                                 (string/join (map (vec (:limits session))
+                                                (fn ([window state])
+                                                  (str window
+                                                    " "
+                                                    (math/round (* 100 (or (:used state) 0)))
+                                                    "%")))
+                                   " · ")))
+                             (if (empty? (waiting m session))
+                               "click: the session · C-c C-o in it: the session menu"
+                               "click: answer it here, in the minibuffer")]
+                   (fn (line) line))
+           (always-lines always)))))
 
 (defn agent-segment (m _pane _buffer)
   "The agent chip as a segment, or nil when the selected buffer's project has no session."
@@ -130,7 +150,7 @@ recent live one in this buffer's project — as its buffer shows it, or nil."
          :face (chip-face m session)
          :on-click (if (empty? (waiting m session))
                      (quote bedit-agent/commands/cmd-agent)
-                     (quote bedit-agent/permission/cmd-agent-approvals))
+                     (quote bedit-agent/permission/cmd-agent-answer))
          :tooltip (fn (now) (tooltip now session))}))))
 
 (statusbar/register-modeline-segment :agent 45 'bedit-agent/chip/agent-segment)

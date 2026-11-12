@@ -74,6 +74,15 @@ shown), and the buffer's commands."
     (str (:tool request)
       (if (and path (not (= (:tool request) "bash"))) (str " " (relative session path)) ""))))
 
+(defn- asked-what (session request)
+  ;; what a request is about in ONE line, for the minibuffer and the echo area, where its body is
+  ;; not shown: a command itself (its first line, cut at 60 characters), else the tool and file
+  (if (and (= (:tool request) "bash") (string? (:command request)))
+    (let (line (first (string/split (string/trim (:command request)) "\n"))
+          cut (if (> (string/length line) 60) (str (string/substring line 0 59) "…") line))
+      (str "bash `" cut "`"))
+    (target session request)))
+
 (defn permission-request (m input &optional (size nil))
   "A tool call's permission request (`[:agent-tool {:op :permission …} reply-to tag]`): answered
 at once when the session's profile, as it is now, allows it (or an earlier `a` covers it) and it
@@ -106,10 +115,11 @@ the window's `[cols rows]`, so a chat at its prompt scrolls to show the question
               later (if chat? (not-asked-why queued session) nil)
               said (fn (shown where)
                      (message shown
-                       (str (title session) " asks to " (target session request) " — " where))))
+                       (str (title session) " asks: " (asked-what session request) " — " where))))
           (cond
-            (not chat?)
-              (said (show-approvals queued :display size) (str "answer in " approvals-name))
+            ;; a terminal session's keys are its program's: no window opens, and nothing is
+            ;; asked until you click the chip (`cmd-agent-answer`)
+            (not chat?) (said (show-approvals queued :none size) "click the ✦ chip to answer")
             later (said (show-approvals queued :none size) later)
             else (show-approvals queued :none size))))))
 
@@ -122,7 +132,7 @@ the window's `[cols rows]`, so a chat at its prompt scrolls to show the question
         start (or (:input-start buffer) 0))
     (cond
       (not (= (buffer-name buffer) (:buffer session)))
-        (str "it asks when you are in " (:buffer session))
+        "click the ✦ chip to answer, or it asks at the chat's prompt"
       (map/get-in m [:read-char :agent-ask]) nil
       (:put-off oldest) "it waits behind a request you put off: C-c C-a asks"
       (< (buffer-point buffer) start) "it asks when you are at your prompt"
@@ -328,7 +338,7 @@ the keys that answer it. `[]` when nothing waits."
   (let (session (session-of m (:session ask)))
     (str (title session)
       ": allow "
-      (target session (:request ask))
+      (asked-what session (:request ask))
       (if (empty? (:outside ask)) "" " (outside the project)")
       "? (y, n, a always"
       (if (file-request? ask) ", o the file" "")
@@ -351,8 +361,11 @@ question above the prompt says it is being asked, and a request settled some oth
 
 (defn minibuffer-answer (m ask-id key)
   "What key `key` does to the request `ask-id` asked in the minibuffer: answers it, shows its
-file, or asks again with the keys that answer."
-  (let (ask (seq/find (or (:agent-asks m) []) (fn (waiting) (= (:id waiting) ask-id))))
+file, or asks again with the keys that answer. The prompt leaves the echo area once a key
+answers it, as Emacs's does — the answer is written under the call's row — rather than staying
+there into whatever buffer you go to next."
+  (let (ask (seq/find (or (:agent-asks m) []) (fn (waiting) (= (:id waiting) ask-id)))
+        m (assoc m :echo ""))
     (cond
       (nil? ask) (message m "that request was already settled")
       (includes? ["y" "Y"] key) (answer m ask-id :allow)
@@ -607,16 +620,21 @@ change — or why not."
   ;; `buffer`, the selected one, with point at the start of 0-based `line0`
   (ed-set-buf m (pool/ed-goto-line buffer (inc line0))))
 
-(defcommand cmd-agent-approvals
+(defn- request-to-answer (m)
+  ;; the request answering asks first: the oldest of the session whose buffer you are in, else
+  ;; the oldest of all — nil when nothing waits
+  (let (session (session-of m (:agent-session (ed-current-buf m)))
+        theirs (if session (session-asks m (:id session)) []))
+    (or (first theirs) (first (or (:agent-asks m) [])))))
+
+(defcommand cmd-agent-answer
   (m key)
-  "C-c C-a in a chat: its waiting request asked again in the minibuffer, put off or not. With
-none waiting there, and as M-x agent-approvals: every request, in *agent: approvals*, selected."
-  (let (buffer (ed-current-buf m)
-        session (session-of m (:agent-session buffer))
-        ask (if (and session (= (:frontend session) :chat))
-              (first (session-asks m (:id session)))
-              nil))
-    (if ask
+  "Answer an agent's request in the minibuffer, wherever you are: the chip's click and C-c C-a
+in a chat. The oldest request of the session you are in, else the oldest of all, put off or
+not; nothing opens. M-x agent-approvals lists them all."
+  (let (ask (request-to-answer m))
+    (if (nil? ask)
+      (message m "no agent is waiting for your answer")
       (ask-in-minibuffer (show-approvals (assoc m
                                            :agent-asks
                                              (vec (map (:agent-asks m)
@@ -625,10 +643,16 @@ none waiting there, and as M-x agent-approvals: every request, in *agent: approv
                                                         (dissoc waiting :put-off)
                                                         waiting)))))
                            :none)
-        ask)
-      (let (shown (show-approvals m :display)
-            index (ed-buffer-index-by-name shown approvals-name))
-        (if index (pool/ed-pop-to-index shown index) shown)))))
+        ask))))
+
+(defcommand cmd-agent-approvals
+  (m key)
+  "Every request the agents are waiting on you for, with its whole command or diff, in
+*agent: approvals*, selected (M-x agent-approvals, and the session menu). Answering one needs no
+buffer: [[cmd-agent-answer]]."
+  (let (shown (show-approvals m :display)
+        index (ed-buffer-index-by-name shown approvals-name))
+    (if index (pool/ed-pop-to-index shown index) shown)))
 
 (def approvals-keymap
   (-> {}

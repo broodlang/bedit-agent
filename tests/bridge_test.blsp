@@ -77,28 +77,35 @@
   (receive ([:agent-tool-reply ^tag result] (:output result)) (after 1000 :none)))
 
 (describe "permission"
-  (test "a request waits in *agent: approvals*, shown whole, and the answer goes back"
+  (test "a terminal session's request opens nothing; the chip asks it in the minibuffer"
     (let ([m _dir _file] (bt-setup)
           [queued tag] (bt-request m
                          {:tool "bash"
                           :risk :run
                           :command "rm -rf build && make all"
-                          :what "bash: rm -rf build && make all"})
-          index (ed-buffer-index-by-name queued "*agent: approvals*"))
+                          :what "bash: rm -rf build && make all"}))
       (assert= (count (:agent-asks queued)) 1)
-      (is (int? index))
-      (is (includes? (buffer-text (ed-buf-at queued (or index 0))) "$ rm -rf build && make all"))
-      ;; one line in the echo area, never the request
-      (is (includes? (:echo queued) "answer in *agent: approvals*"))
-      (let (answered (answer queued (:id (first (:agent-asks queued))) :always))
-        (assert= (bt-answer tag) "allow")
-        (assert= (:agent-asks answered) [])
-        (is (includes? (buffer-text (ed-buf-at answered (or index 0))) "Nothing is waiting"))
-        ;; `a`: that very command is not asked about again
-        (let ([again tag2] (bt-request answered
-                             {:tool "bash" :risk :run :command "rm -rf build && make all" :what "x"}))
-          (assert= (count (:agent-asks again)) 0)
-          (assert= (bt-answer tag2) "allow")))))
+      (is (not (bedit-agent/transcript/shown? queued "*agent: approvals*")))
+      ;; one line in the echo area: the command itself, and how to answer
+      (is (includes? (:echo queued) "bash `rm -rf build && make all` — click the ✦ chip to answer"))
+      (let (asked (cmd-agent-answer queued nil))
+        (is (includes? (:prompt (:read-char asked))
+              "allow bash `rm -rf build && make all`? (y, n, a always)"))
+        (let (answered ((map/get-in asked [:read-char :then]) (dissoc asked :read-char) "a"))
+          (assert= (bt-answer tag) "allow")
+          (assert= (:agent-asks answered) [])
+          (assert= (:echo answered) "")
+          ;; `a`: that very command is not asked about again
+          (let ([again tag2] (bt-request answered
+                               {:tool "bash"
+                                :risk :run
+                                :command "rm -rf build && make all"
+                                :what "x"}))
+            (assert= (count (:agent-asks again)) 0)
+            (assert= (bt-answer tag2) "allow"))))))
+  (test "with nothing waiting, answering says so and opens nothing"
+    (let ([m _dir _file] (bt-setup))
+      (is (includes? (:echo (cmd-agent-answer m nil)) "no agent is waiting"))))
   (test "a key in the approvals buffer answers the request at point"
     (let ([m _dir _file] (bt-setup)
           [one tag1] (bt-request m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})

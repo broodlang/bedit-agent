@@ -337,7 +337,7 @@ conversation."
     (keymap-bind [:ctrl-c :ctrl-c] 'bedit-agent/chat/cmd-agent-interrupt)
     (keymap-bind [:ctrl-c :ctrl-k] 'bedit-agent/chat/cmd-agent-end)
     (keymap-bind [:ctrl-c :ctrl-o] 'bedit-agent/menu/cmd-agent-menu)
-    (keymap-bind [:ctrl-c :ctrl-a] 'bedit-agent/permission/cmd-agent-approvals)
+    (keymap-bind [:ctrl-c :ctrl-a] 'bedit-agent/permission/cmd-agent-answer)
     (keymap-bind [:ctrl-a] 'bedit-agent/chat/cmd-agent-beginning-of-line)
     (keymap-bind ["n"] 'bedit-agent/chat/cmd-agent-next-row)
     (keymap-bind ["p"] 'bedit-agent/chat/cmd-agent-previous-row)

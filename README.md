@@ -62,7 +62,7 @@ I'll run them first.
 - **C-/** undoes your typing and never what the agent wrote meanwhile: its text goes in as program output, which undo steps over.
 - **C-c C-c** interrupts the turn. **C-c C-k** ends the session. Write in an ended chat and it goes on: its tools and agent start again, the conversation resumed.
 - **C-x k** on a session's buffer asks first while its agent is working or waiting for your answer, or while Claude Code runs in a TUI session's terminal.
-- A request is asked in the minibuffer (see Approvals). **C-c C-a** asks a put-off one again, or lists every request. **C-c C-o** opens the session menu.
+- A request is asked in the minibuffer (see Approvals). **C-c C-a** asks it now, put off or not. **C-c C-o** opens the session menu.
 - **M-x agent-resume** goes on with an earlier chat of this project. Each one is listed by the first message you sent it and when you last used it, and its transcript is replayed from Claude Code's own log.
 - The cursor sticks to the prompt as text streams in above it, and a window at the prompt follows the tail as a compile buffer does, whether or not you are in it. Move up into the transcript and you stay where you are.
 - The transcript reads like a compile buffer: nothing is typed there and the cursor stays where it is. **n** / **p** go to the next and previous turn or tool call, and a letter is refused. At the prompt they are letters as usual.
@@ -93,13 +93,19 @@ The line under the request says whether it is being asked now. The answer is wri
 call's row and the next request, if any, is asked. A request settled while its question stands
 (it expired, or its session ended) takes the question down with it.
 
-**`*agent: approvals*` lists every request**, from every session, with its session. A TUI
-session's requests open it beside you without taking the cursor, since a terminal's keys are its
-program's. `M-x agent-approvals` or a click on the chip goes there (C-c C-a too, in a chat with
-nothing waiting). There **y** / **n** / **a** / **o** answer the request at point, else the first;
-**RET** / **TAB** go to the next request, and **q** puts the buffer away (the requests keep
-waiting). Once nothing waits, its window goes away the way Emacs's quit-window takes a popup
-away: a window split off for it is deleted, and a window it borrowed shows what it showed before.
+**Answering never needs a buffer.** Wherever you are, a click on the amber chip asks the request
+in the minibuffer: `bedit/dev: allow bash `make test`? (y, n, a always)`. A command is shown
+itself, cut to one line. It is the oldest request of the session you are in, else the oldest of
+all. **C-c C-a** in a chat does the same. A TUI session's request opens nothing; the echo area
+names the command and the chip. While a question stands the caret sits after it in the echo
+area and the buffer's caret is hollow, so it is clear where your keys go; once answered, the
+prompt leaves the echo area.
+
+**`M-x agent-approvals` lists every request**, from every session, with its whole command or
+diff, in `*agent: approvals*` (the session menu has it too). There **y** / **n** / **a** / **o**
+answer the request at point, else the first; **RET** / **TAB** go to the next request, and **q**
+puts the buffer away (the requests keep waiting). Once nothing waits, its window goes away the
+way Emacs's quit-window takes a popup away.
 
 Ending or interrupting a session declines whatever it has waiting. A request nobody answers for
 30 minutes is declined, said under its call, and leaves the queue; the agent is told nobody
@@ -118,10 +124,10 @@ A transient over the session as it is now:
 In any buffer of a project with a session:
 
 - `✦ dev · working 14s` while a turn runs, in the accent colour.
-- `✦ dev · allow? 2 waiting` while requests wait, in amber. A click opens the approvals.
+- `✦ dev · allow? 2 waiting` while requests wait, in amber. A click asks the oldest in the minibuffer, here.
 - `✦ dev · 41k · 5h 62%` when idle: the context used and the plan window.
 
-Click it to go to the session. Hover it for the model, effort, account, plan windows and "always" answers.
+Otherwise a click goes to the session. Hover it for the model, effort, account, plan windows and "always" answers.
 
 ## Handing the agent context
 

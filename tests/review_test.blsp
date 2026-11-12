@@ -406,6 +406,7 @@
             after (widen (ed-current-buf answered)))
         (assert= (rt-answer tag) "allow")
         (is (not (includes? (buffer-text after) "◆ allow")))
+        (assert= (:echo answered) "")
         (is (string/ends-with? (buffer-text after) "\n❯ "))
         (assert= (buffer-point after) (buffer-length after)))))
   (test "another key asks again; nothing is asked while you are writing a message"
@@ -425,7 +426,7 @@
       (is (nil? (:read-char put)))
       (is (nil? (:read-char (ask-waiting put))))
       (is (includes? (buffer-text (widen (ed-current-buf put))) "put off — C-c C-a asks again"))
-      (let (asked (cmd-agent-approvals put nil))
+      (let (asked (cmd-agent-answer put nil))
         (is (:read-char asked))
         (rt-key asked "a")
         (assert= (rt-answer tag) "allow"))))
@@ -585,3 +586,20 @@
       (is (string/ends-with? (buffer-text (widen shown)) "❯ "))
       (is (not (includes? (buffer-text (widen gone)) "◆ allow")))
       (is (string/ends-with? (buffer-text (widen gone)) "❯ ")))))
+
+(describe "the chip, with a request waiting"
+  (test "its click answers in the minibuffer; its tooltip never runs off the window"
+    (let ([m _dir _file] (rt-setup)
+          long (str "mix deps.get 2>&1 | tail -3; "
+                 (string/join (map (range 20) (fn (i) (str "step" i))) " && "))
+          remembered (put-session m
+                       (assoc (session-of m "a1")
+                         :always {:tools #{"edit"} :commands #{long "ls" "pwd" "make" "git status"}}))
+          [queued _] (rt-permission remembered
+                       {:tool "bash" :risk :run :command "make test" :what "bash: make test"})
+          segment (bedit-agent/chip/agent-segment queued nil nil)
+          lines ((:tooltip segment) queued))
+      (assert= (:on-click segment) 'bedit-agent/permission/cmd-agent-answer)
+      (is (every? lines (fn (line) (<= (string/length line) 72))))
+      (is (includes? lines "always: … 2 more commands"))
+      (is (includes? lines "click: answer it here, in the minibuffer")))))
