@@ -37,7 +37,7 @@ its account (`label`).")
 (defn- json-string (text key)
   ;; the first `"key": "value"` in `text` — the account files run to hundreds of KB, and only
   ;; two fields of one object are wanted, so they are found rather than the whole file parsed
-  (when-let (found (regex/find (str "\"" key "\"\\s*:\\s*\"([^\"]*)\"") text))
+  (when-let (found (regex/find text (str "\"" key "\"\\s*:\\s*\"([^\"]*)\"")))
     (:text (first (:groups found)))))
 
 (defn account (dir)

@@ -55,10 +55,10 @@ agent is told to ask again rather than told the file is clean."
     (cond
       (:details result) (:details result)
       (= (:tool request) "bash")
-        (vec (map (seq/take-last (string/split (string/trimr (or (:output result) "")) "\n") 3)
+        (vec (map (seq/take-last (string/split (string/trim-right (or (:output result) "")) "\n") 3)
                (fn (line) [line :syntax/comment])))
       (includes? ["grep" "diagnostics"] (:tool request))
-        (vec (map (string/split (string/trimr (or (:output result) "")) "\n")
+        (vec (map (string/split (string/trim-right (or (:output result) "")) "\n")
                (fn (line) [(relative session line) :syntax/string])))
       else [])))
 

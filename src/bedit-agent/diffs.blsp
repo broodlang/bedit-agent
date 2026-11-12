@@ -26,7 +26,7 @@ transcript shows under an edit and a proposed change shows before you allow it.
   "Unified diff `text` as `[text face]` lines, each coloured as [[diff-spans]] colours it.
 
     (bedit-agent/diffs/unified-lines \"@@ -1 +1 @@\\n-a\")   ;=> [[\"@@ -1 +1 @@\" :syntax/keyword] [\"-a\" :syntax/error]]"
-  (vec (map (string/split (string/trimr text) "\n") (fn (line) [line (line-face line)]))))
+  (vec (map (string/split (string/trim-right text) "\n") (fn (line) [line (line-face line)]))))
 
 (defn diff-spans (text)
   "The faces of unified diff `text`, line by line: a hunk header, a removed line, an added line,

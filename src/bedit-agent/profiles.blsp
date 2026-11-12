@@ -168,6 +168,6 @@ nil when there is none. A cycle stops where it repeats.
     (bedit-agent/profiles/command-allowed? {:allow-commands [\"nest test\"]} \"nest test tests/a_test.blsp\")   ;=> true
     (bedit-agent/profiles/command-allowed? {:allow-commands [\"nest test\"]} \"nest test; rm -rf x\")   ;=> false"
   (let (trimmed (string/trim command))
-    (and (not (regex/match? "[;&|`$<>(){}\\n\\\\]" trimmed))
+    (and (not (regex/match? trimmed "[;&|`$<>(){}\\n\\\\]"))
       (any? (or (:allow-commands profile) [])
         (fn (prefix) (or (= trimmed prefix) (string/starts-with? trimmed (str prefix " "))))))))

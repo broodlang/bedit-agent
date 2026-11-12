@@ -116,7 +116,7 @@ for its answer — a tool result — or a failed result once `timeout-ms` (defau
       (not (= (:exit result) 0)) (failed (string/trim (:stderr result)))
       else
         (let (text (string/replace (:stdout result) (str root "/") "")
-              found (count (string/split (string/trimr text) "\n")))
+              found (count (string/split (string/trim-right text) "\n")))
           (succeeded (clip text) (str found (if (= found 1) " match" " matches")))))))
 
 (defn- glob-files (root args)
@@ -131,7 +131,7 @@ for its answer — a tool result — or a failed result once `timeout-ms` (defau
       (failure? result) (failed (error-message result))
       (string/blank? (:stdout result)) (succeeded "no files" "no files")
       else
-        (let (files (sort (string/split (string/trimr (:stdout result)) "\n")))
+        (let (files (sort (string/split (string/trim-right (:stdout result)) "\n")))
           (succeeded (clip (string/join files "\n")) (str (count files) " files"))))))
 
 (defn read-disk (path offset limit)
