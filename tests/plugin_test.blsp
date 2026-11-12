@@ -1,0 +1,15 @@
+;; What bedit asks of the package by name (`bedit-plugin`): its key, and the clean-up it runs
+;; before it is removed or updated.
+
+(defmodule plugin-test
+  (:use test))
+
+(describe "the plugin map"
+  (test "C-c a binds this project's chat, and compiles with no warning"
+    (let (plugin (bedit-agent/bedit-plugin)
+          compiled (userkeys/ed-user-keys (:keys plugin) {} "package bedit-agent"))
+      (assert= (:warnings compiled) [])
+      ;; the command by its full name: the short `commands/cmd-claude` would read as bedit's own module
+      (assert= (:global compiled) [[[:ctrl-c "a"] 'bedit-agent/bedit-agent/commands/cmd-claude]])))
+  (test "its :on-retire names a function that is defined"
+    (is (bound? (:on-retire (bedit-agent/bedit-plugin))))))

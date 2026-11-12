@@ -8,7 +8,7 @@
 ;; are the agent-neutral part.
 (project
   :name "bedit-agent"
-  :version "0.1.0"
+  :version "0.2.0"
   :brood ">= 0.50.0"
   :description
     "Coding agents in bedit: per-project profiles, several sessions per project, a chat buffer where every tool is bedit's, or the agent's own terminal UI with bedit's tools added. Claude Code on the subscription first."

@@ -9,14 +9,15 @@ cannot switch the provider), and the session's first event must say no API key i
 
 ## Two front ends, one set of profiles and tools
 
-| | `M-x claude` (chat) | `M-x claude-tui` |
+| | `C-c a`, `M-x claude` (chat) | `M-x claude-tui` |
 |---|---|---|
 | What you see | a bedit buffer: the transcript, your prompt below it | Claude Code's own interface, in a terminal buffer |
 | The agent's tools | **bedit's only**: every call goes through bedit | Claude Code's own, plus bedit's |
-| Permission | bedit asks in `*agent: approvals*` | Claude Code asks for its tools; bedit asks for its own |
+| Permission | bedit asks in the minibuffer, the request shown above the prompt | Claude Code asks for its tools; bedit asks for its own |
 | What ran | written under each call in the transcript, with the diff | an edit is said in the echo area |
 
-Each opens this project's session of that kind, or starts one. `M-x agent-new` starts another
+Each opens this project's session of that kind, or starts one. `C-c a` is the package's key; bind
+it elsewhere, or away, in init.blsp's `:keys` (`"C-c a" nil`). `M-x agent-new` starts another
 under any profile; `M-x agent-switch` goes to any running session in any project.
 
 ### bedit's tools
@@ -59,32 +60,46 @@ I'll run them first.
 - **C-j** adds a newline. **C-a** goes to the start of your message, after the prompt.
 - **M-p** / **M-n** / **C-r** recall what you sent.
 - **C-c C-c** interrupts the turn. **C-c C-k** ends the session. Write in an ended chat and it goes on: its tools and agent start again, the conversation resumed.
-- **C-c C-a** goes to the approvals. **C-c C-o** opens the session menu.
+- **C-x k** on a session's buffer asks first while its agent is working or waiting for your answer, or while Claude Code runs in a TUI session's terminal.
+- A request is asked in the minibuffer (see Approvals). **C-c C-a** asks a put-off one again, or lists every request. **C-c C-o** opens the session menu.
 - **M-x agent-resume** goes on with an earlier chat of this project. Each one is listed by the first message you sent it and when you last used it, and its transcript is replayed from Claude Code's own log.
 - The cursor sticks to the prompt as text streams in above it, and a window at the prompt follows the tail as a compile buffer does, whether or not you are in it. Move up into the transcript and you stay where you are.
-- The transcript is bedit's: only your message is editable.
+- The transcript reads like a compile buffer: nothing is typed there and the cursor stays where it is. **n** / **p** go to the next and previous turn or tool call, and a letter is refused. At the prompt they are letters as usual.
 - The agent writes Markdown, and it is coloured as Markdown, fenced code included. The transcript's own lines have their own faces.
 - Each call's result, and your answer to it, is written under its own row, even when the agent makes several calls before any answers.
 - A turn that ends while no window shows its chat is said in the echo area.
 
 ### Approvals
 
-A call the profile doesn't allow, and anything that reaches outside the project, waits in
-`*agent: approvals*`. It opens beside you without taking the cursor; the echo area gets one line
-and the chip turns amber. Each request shows its session, the tool and file, a command in full,
-and an edit or write as the diff it would make to the file as bedit has it, with the lines
-around it. Go there with **C-c C-a** in a chat, a click on the chip, or `M-x agent-approvals`.
-A key answers the request at point, else the first:
+A call the profile doesn't allow, and anything that reaches outside the project, waits for your
+answer, and the chip turns amber.
+
+**A chat asks in the minibuffer**, one key, as Emacs's y-or-n questions do:
+`bedit/dev: allow edit a.txt? (y, n, a always, o the file)`. No window opens. Meanwhile the
+request is shown above the prompt: the tool and file, a command in full, or an edit or write as
+the diff it would make to the file as bedit has it, with the lines around it.
 
 - **y** allows the call. **n** declines it.
 - **a** allows it for the rest of the session. For `bash` that covers only this exact command.
-- **o** opens the file it is about, at the text an edit would change.
-- **RET** / **TAB** go to the next request. **q** puts the buffer away; the requests keep waiting.
+- **o** opens the file it is about, at the text an edit would change; it asks again when you come back.
+- Any other key asks again. **C-g** puts it off: it waits, shown above the prompt, until **C-c C-a** asks it again.
 
-A key typed anywhere else never answers a request. Once nothing waits, the window goes away the
-way Emacs's quit-window takes a popup away: a window split off for it is deleted, and a window it
-borrowed shows what it showed before. Ending or interrupting a session declines whatever it has
-waiting.
+It is asked only while you are in that chat with nothing typed at its prompt, so it never takes
+a key meant for your message or another buffer: a request that arrives while you are elsewhere,
+or mid-message, is asked when you come back or clear the prompt, and the echo area says which
+chat it is in. The answer is written under the call's row and the next request, if any, is asked.
+
+**`*agent: approvals*` lists every request**, from every session, with its session. A TUI
+session's requests open it beside you without taking the cursor, since a terminal's keys are its
+program's. `M-x agent-approvals` or a click on the chip goes there (C-c C-a too, in a chat with
+nothing waiting). There **y** / **n** / **a** / **o** answer the request at point, else the first;
+**RET** / **TAB** go to the next request, and **q** puts the buffer away (the requests keep
+waiting). Once nothing waits, its window goes away the way Emacs's quit-window takes a popup
+away: a window split off for it is deleted, and a window it borrowed shows what it showed before.
+
+Ending or interrupting a session declines whatever it has waiting. A request nobody answers for
+30 minutes is declined, said under its call, and leaves the queue; the agent is told nobody
+answered.
 
 ### The session menu (C-c C-o, `M-x agent-menu`)
 
@@ -108,7 +123,7 @@ Click it to go to the session. Hover it for the model, effort, account, plan win
 
 `M-x agent-send-region` (quoted with its `file:line`), `agent-send-buffer` (unsaved text
 included), `agent-send-file` (`@path`) and `agent-send-diagnostics`. Each goes to the session
-you are in, else the project's latest. In a chat it lands in your message for you to send. In
+you are in, else the project's latest, which opens beside you. In a chat it lands in your message for you to send. In
 a TUI session it is pasted into Claude Code.
 
 ## Profiles, per project
@@ -174,9 +189,12 @@ what bedit already shows in a file it just edited.
 
 ## Install
 
-Both packages go in bedit's package dir (`~/.config/bedit/packages/`), with `agentkit` beside
-`bedit-agent`. bedit puts a plugin's `:dependencies` that are installed beside it on the load
-path first. Needs a brood with `mcp-server` (ADR-711).
+In bedit, `M-x package-install RET bedit-agent` (or `i` on it in `M-x package-list`). bedit
+installs `agentkit`, the library it uses, from the hive beside it, loads it first, and binds
+`C-c a`. `M-x package-remove` takes both away again, and the key with them. Needs a brood
+with `mcp-server` (ADR-711).
+
+Developing it, with bedit checked out beside it:
 
 ```bash
 nest test                                                     # 58 tests, no network, no claude
