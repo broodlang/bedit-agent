@@ -43,6 +43,29 @@
       (is (includes? text "  ⏺ bash nest test\n    ⎿ 3 passed\n── 41k context ──"))
       (is (string/ends-with? text "❯ half a thought"))
       (assert= (:busy (session-of m "a1")) false)))
+  (test "undo takes back what you typed, never what the agent wrote meanwhile"
+    (let (typed (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "half a thought"))
+          written (ct-event typed :text "Hello.")
+          undone (ed-set-buf written (undo (ed-current-buf written)))
+          ;; the agent goes on writing between the undo and the redo
+          more (ct-event undone :text "And more.")
+          ;; a fresh undo run after an undo redoes
+          redone (undo (ed-current-buf more)))
+      (is (includes? (ct-text undone) "Hello."))
+      (is (string/ends-with? (ct-text undone) "❯ "))
+      (is (string/ends-with? (buffer-text redone) "❯ half a thought"))
+      (is (includes? (buffer-text redone) "Hello."))
+      (is (includes? (buffer-text redone) "And more."))))
+  (test "C-/ at the prompt undoes your typing through the editor's own undo"
+    (let (press (fn (m key) (input/ed-update m key 80 24))
+          typed (fold ["h" "i"] (ct-model) press)
+          written (ct-event typed :text "Hello.")
+          undone (press written :ctrl-/))
+      (is (includes? (ct-text undone) "Hello."))
+      (is (not (string/ends-with? (ct-text undone) "hi")))))
+  (test "opening a chat leaves nothing to undo"
+    (let (buffer (ed-current-buf (ct-model)))
+      (assert= (buffer-text (undo buffer)) (buffer-text buffer))))
   (test "RET sends the input as the next message and clears it"
     (let (m (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "fix it")))
       (let (sent (cmd-agent-return m nil))

@@ -518,3 +518,57 @@
           (is (includes? (buffer-text (ed-current-buf sent))
                 "── the session goes on ──\n» and then?"))
           (stop-processes session))))))
+
+(describe "a request asked in the minibuffer, at the right moment"
+  (test "not in the middle of a key sequence: C-x or C-u typed waits for its command"
+    (let ([m _dir _file] (rt-setup)
+          [queued _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (is (nil? (:read-char (ask-waiting (assoc queued :pending {:keymap 1})))))
+      (is (nil? (:read-char (ask-waiting (assoc queued :prefix-arg {:count 4 :raw true})))))
+      (is (:read-char (ask-waiting queued)))))
+  (test "the line under the request says whether it is being asked now"
+    (let ([m _dir _file] (rt-setup)
+          [queued _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          writing (typing/cmd-self-insert queued "h")
+          [waiting _] (rt-permission writing
+                        {:tool "bash" :risk :run :command "pwd" :what "bash: pwd"})
+          asked (ask-waiting queued))
+      (is (includes? (buffer-text (widen (ed-current-buf waiting)))
+            "asked in the minibuffer once your prompt is empty"))
+      (is (includes? (buffer-text (widen (ed-current-buf asked)))
+            "asked in the minibuffer — C-g puts it off"))))
+  (test "a request that cannot be asked at once says when it will be"
+    (let ([m _dir _file] (rt-setup)
+          writing (typing/cmd-self-insert m "h")
+          up (ed-set-buf m (goto-char (ed-current-buf m) 0))
+          [typed _] (rt-permission writing {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          [reading _] (rt-permission up {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          [here _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"}))
+      (is (includes? (:echo typed) "it asks once your prompt is empty"))
+      (is (includes? (:echo reading) "it asks when you are at your prompt"))
+      ;; at an empty prompt it is asked, so nothing is said
+      (is (not (includes? (or (:echo here) "") "it asks")))))
+  (test "a request settled while asked takes the question down"
+    (let ([m _dir _file] (rt-setup)
+          [queued tag] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          asked (ask-waiting queued)
+          ended (decline-asks asked "a1"))
+      (is (:read-char asked))
+      (is (nil? (:read-char ended)))
+      (assert= (rt-answer tag) "deny")))
+  (test "an expired request takes the question down too"
+    (let ([m _dir _file] (rt-setup)
+          [queued _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          asked (ask-waiting queued)
+          old (assoc asked
+                :agent-asks (vec (map (:agent-asks asked) (fn (ask) (assoc ask :asked 0))))))
+      (is (nil? (:read-char (expire-asks old))))))
+  (test "a key for a request no longer waiting says so"
+    (let ([m _dir _file] (rt-setup))
+      (is (includes? (:echo (minibuffer-answer m "q99" "y")) "already settled"))))
+  (test "o is only for a request about a file: for a command it asks again"
+    (let ([m _dir _file] (rt-setup)
+          [queued _] (rt-permission m {:tool "bash" :risk :run :command "ls" :what "bash: ls"})
+          again (rt-key (ask-waiting queued) "o"))
+      (is (:read-char again))
+      (is (not (includes? (:prompt (:read-char again)) "o the file"))))))

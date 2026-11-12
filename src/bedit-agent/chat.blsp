@@ -194,9 +194,11 @@ queued behind a turn sent once it ends."
                  (path/abbreviate (:root session))
                  (if (:config-dir session) (str " · " (path/abbreviate (:config-dir session))) "")
                  "\nRET sends · C-j a newline · C-c C-a approvals · C-c C-c interrupts · C-c C-o the menu\n")
-        base (disable-undo (set-buffer-type (make-buffer "" (:buffer session)) :agent-chat))
+        base (set-buffer-type (make-buffer "" (:buffer session)) :agent-chat)
         text (str header prompt)
-        buffer (assoc (end-of-buffer (insert base
+        ;; the header and prompt are the program's, as everything above the input is: no undo step
+        buffer (assoc (end-of-buffer (insert-program-output base
+                                       0
                                        text
                                        {face-property [[0 (string/length text) :syntax/comment]]}))
                  :dir (:root session)

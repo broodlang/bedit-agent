@@ -59,6 +59,7 @@ I'll run them first.
 - **RET** at the prompt sends. While the agent is still working, your message is queued (`» … (queued)`) and goes the moment the turn ends. On a `path:line` in the transcript it opens the file there. Anywhere else it returns to the prompt.
 - **C-j** adds a newline. **C-a** goes to the start of your message, after the prompt.
 - **M-p** / **M-n** / **C-r** recall what you sent.
+- **C-/** undoes your typing and never what the agent wrote meanwhile: its text goes in as program output, which undo steps over.
 - **C-c C-c** interrupts the turn. **C-c C-k** ends the session. Write in an ended chat and it goes on: its tools and agent start again, the conversation resumed.
 - **C-x k** on a session's buffer asks first while its agent is working or waiting for your answer, or while Claude Code runs in a TUI session's terminal.
 - A request is asked in the minibuffer (see Approvals). **C-c C-a** asks a put-off one again, or lists every request. **C-c C-o** opens the session menu.
@@ -84,10 +85,13 @@ the diff it would make to the file as bedit has it, with the lines around it.
 - **o** opens the file it is about, at the text an edit would change; it asks again when you come back.
 - Any other key asks again. **C-g** puts it off: it waits, shown above the prompt, until **C-c C-a** asks it again.
 
-It is asked only while you are in that chat with nothing typed at its prompt, so it never takes
-a key meant for your message or another buffer: a request that arrives while you are elsewhere,
-or mid-message, is asked when you come back or clear the prompt, and the echo area says which
-chat it is in. The answer is written under the call's row and the next request, if any, is asked.
+It is asked only while you are in that chat with nothing typed at its prompt, and never in the
+middle of a key sequence (`C-x …`, `C-u …`), so it never takes a key meant for your message or
+another buffer. A request that arrives while you are elsewhere, up in the transcript or
+mid-message is asked when you come back to the prompt or clear it, and the echo area says so.
+The line under the request says whether it is being asked now. The answer is written under the
+call's row and the next request, if any, is asked. A request settled while its question stands
+(it expired, or its session ended) takes the question down with it.
 
 **`*agent: approvals*` lists every request**, from every session, with its session. A TUI
 session's requests open it beside you without taking the cursor, since a terminal's keys are its
@@ -191,8 +195,8 @@ what bedit already shows in a file it just edited.
 
 In bedit, `M-x package-install RET bedit-agent` (or `i` on it in `M-x package-list`). bedit
 installs `agentkit`, the library it uses, from the hive beside it, loads it first, and binds
-`C-c a`. `M-x package-remove` takes both away again, and the key with them. Needs a brood
-with `mcp-server` (ADR-711).
+`C-c a`. `M-x package-remove` takes both away again, and the key with them. Needs brood
+0.51.0 or later (`mcp-server`, ADR-711; `insert-program-output`, ADR-712).
 
 Developing it, with bedit checked out beside it:
 

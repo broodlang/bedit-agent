@@ -14,8 +14,9 @@
 ;;     ❯ _
 ;;
 ;; THE TRANSCRIPT IS bedit's. Only the input after the prompt is editable (the buffer is
-;; narrowed to it) and the buffer keeps no undo history — undo restores whole texts, so undoing
-;; your typing would take back what the agent wrote since. A tool call's details are what bedit
+;; narrowed to it). What the agent writes goes in as PROGRAM OUTPUT (brood's
+;; `insert-program-output`, ADR-712): into the text and every snapshot of its undo history, so
+;; undo and redo of your typing step over it and leave the transcript as it is. A tool call's details are what bedit
 ;; knows of it (`feedback`), written under its row whatever order calls finish in (each row
 ;; keeps a marker), and a `path:line` in them is a link.
 ;;
@@ -61,14 +62,11 @@ and mark when they were past `at`; markers set there to advance (a tool row's) m
   (let (length (string/length text))
     (if (= length 0)
       buffer
-      (let (point (buffer-point buffer)
-            mark (:mark buffer)
-            properties (if face {face-property [[0 length face]]} nil)
-            written (replace-region (widen buffer) at at text properties)
-            shift (fn (position)
-                    (if (and (int? position) (>= position at)) (+ position length) position)))
-        (input-only (assoc (goto-char written (shift point))
-                      :mark (shift mark)
+      (let (properties (if face {face-property [[0 length face]]} nil)
+            ;; recorded nowhere, and in every snapshot of the history: point, mark and the
+            ;; narrowing past `at` move with it
+            written (insert-program-output buffer at text properties))
+        (input-only (assoc written
                       :transcript-end (+ (or (:transcript-end buffer) 0) length)
                       :input-start (+ (or (:input-start buffer) 0) length)
                       :insert-lo (math/min at (or (:insert-lo buffer) at))))))))
