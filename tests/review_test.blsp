@@ -600,6 +600,6 @@
           segment (bedit-agent/chip/agent-segment queued nil nil)
           lines ((:tooltip segment) queued))
       (assert= (:on-click segment) 'bedit-agent/permission/cmd-agent-answer)
-      (is (every? lines (fn (line) (<= (string/length line) 72))))
+      (is (every? lines (fn (line) (<= (count line) 72))))
       (is (includes? lines "always: … 2 more commands"))
       (is (includes? lines "click: answer it here, in the minibuffer")))))

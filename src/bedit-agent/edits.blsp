@@ -24,7 +24,7 @@
   ;; the offsets of `needle` in `text`, left to right, not overlapping
   (letrec (scan (fn (from found)
                   (let (at (index-of text needle from))
-                    (if (< at 0) found (scan (+ at (string/length needle)) (conj found at))))))
+                    (if (< at 0) found (scan (+ at (count needle)) (conj found at))))))
     (scan 0 [])))
 
 (defn- line-of (text offset)
@@ -81,7 +81,7 @@
       (buffer-rope after)
       from
       to
-      (string/length text))))
+      (count text))))
 
 (defn- remember-original (m session path text)
   ;; `m` with `text` kept as `path`'s text before session `session` first changed it
@@ -177,7 +177,7 @@ read again first."
                     (:path request)
                     "; give more context, or replace_all"))
         else
-          {:splices (vec (map found (fn (at) [at (+ at (string/length old)) new])))
+          {:splices (vec (map found (fn (at) [at (+ at (count old)) new])))
            :line (line-of text (first found))
            :verb "edited"
            :note (str " (" (count found) (if (= (count found) 1) " replacement)" " replacements)"))
@@ -186,7 +186,7 @@ read again first."
 (defn- write-plan (request)
   (fn (text)
     (let (content (or (:content request) ""))
-      {:splices [[0 (string/length text) content]]
+      {:splices [[0 (count text) content]]
        :line 1
        :verb (if (= text "") "wrote" "rewrote")
        :note (str " (" (count (string/split content "\n")) " lines)")

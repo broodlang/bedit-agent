@@ -25,7 +25,7 @@
   (test "a session opens with the prompt last"
     (let (m (ct-model))
       (is (string/ends-with? (ct-text m) "❯ "))
-      (assert= (:input-start (ed-current-buf m)) (string/length (ct-text m)))))
+      (assert= (:input-start (ed-current-buf m)) (count (ct-text m)))))
   (test "streamed text and tool calls land above the prompt, what you typed stays"
     (let (typed (ed-set-buf (ct-model) (insert (ed-current-buf (ct-model)) "half a thought"))
           m (-> typed
@@ -93,7 +93,7 @@ moved its own has none)."
           before (ct-pane-point m)
           after (ct-event m :text-delta "Hello there")
           moved (ct-pane-point after))
-      (assert= moved (+ before (string/length "Hello there")))
+      (assert= moved (+ before (count "Hello there")))
       (assert= moved (:input-start (ed-current-buf after)))))
   (test "a window up in the transcript stays on what it was reading"
     (let (m (ct-model)
@@ -165,7 +165,7 @@ moved its own has none)."
         text (buffer-text buffer)
         at (buffer-point buffer)
         end (index-of text "\n" at))
-    (string/substring text at (if (< end 0) (string/length text) end))))
+    (string/substring text at (if (< end 0) (count text) end))))
 
 (describe "the transcript, read as a compile buffer"
   (test "n and p go between your messages and the calls"

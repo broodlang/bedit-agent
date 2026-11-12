@@ -59,7 +59,7 @@ call's details under its row (`write-ran`), and every window carried (`ed-chat-w
   "`buffer` with `text` inserted at `at` — inside or at the end of its transcript — in `face`
 (a theme role) when one is given. The prompt and what is typed after it move along, as do point
 and mark when they were past `at`; markers set there to advance (a tool row's) move too."
-  (let (length (string/length text))
+  (let (length (count text))
     (if (= length 0)
       buffer
       (let (properties (if face {face-property [[0 length face]]} nil)
@@ -90,7 +90,7 @@ written at `at` (default: the transcript's end); on a line of their own when `fr
              (fn (progress [text face])
                (let ([written position] progress)
                  [(transcript-insert-at written position text face)
-                   (+ position (string/length text))]))))))
+                   (+ position (count text))]))))))
 
 (defn transcript-line (buffer text &optional (face :syntax/comment))
   "`buffer` with `text` on a line of its own at the end of its transcript, in `face`."
@@ -178,9 +178,9 @@ left where it is."
                          ["" []]
                          (fn (built [line face])
                            (let ([so-far found] built
-                                 at (inc (string/length so-far)))
+                                 at (inc (count so-far)))
                              [(str so-far "\n" line)
-                               (if face (conj found [at (+ at (string/length line)) face]) found)]))))
+                               (if face (conj found [at (+ at (count line)) face]) found)]))))
       [(str text "\n") {face-property spans}])))
 
 (defn ed-chat-question (m name lines &optional (size nil))
@@ -201,7 +201,7 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
       question
       size
       lo
-      (string/length (or (:question-text before) "")))))
+      (count (or (:question-text before) "")))))
 
 (defn- question-written (buffer lo:int hi:int text properties)
   ;; `buffer` widened with `[lo, hi)` — the question there now — replaced by `text`, as PROGRAM
@@ -216,7 +216,7 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
   (let ([text properties] question
         before (ed-buf-at m index)
         hi (+ lo length)
-        inserted (string/length text))
+        inserted (count text))
     (if (= text (or (:question-text before) ""))
       m
       (let (written (question-written before lo hi text properties)
@@ -255,7 +255,7 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
 
     (bedit-agent/transcript/first-line \"a\\nb\")   ;=> \"a\""
   (let (line (or (first (string/split (string/trim (str text)) "\n")) ""))
-    (if (> (string/length line) 120) (str (string/substring line 0 117) "…") line)))
+    (if (> (count line) 120) (str (string/substring line 0 117) "…") line)))
 
 ;; A ROW'S MARKER sits at the end of the row's own text, before its newline, and advances: what
 ;; is written under the row goes in there as `\nline` (`under-row`), the marker moving past it,

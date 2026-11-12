@@ -21,7 +21,7 @@
     (bedit-agent/workspace/relative {:root \"/src/x\"} \"/src/x/a/b.txt\")   ;=> \"a/b.txt\""
   (let (root (str (:root session) "/"))
     (if (and (string? path) (string/starts-with? path root))
-      (string/substring path (string/length root) (string/length path))
+      (string/substring path (count root) (count path))
       path)))
 
 (defn buffer-index-for (m path)

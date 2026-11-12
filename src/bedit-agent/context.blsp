@@ -53,8 +53,7 @@
         file (buffer-file buffer))
     (cond
       (nil? file) nil
-      (string/starts-with? file root)
-        (str "@" (string/substring file (string/length root) (string/length file)))
+      (string/starts-with? file root) (str "@" (string/substring file (count root) (count file)))
       else (str "@" file))))
 
 (defcommand cmd-agent-send-region

@@ -37,7 +37,7 @@ the file names.
            [[] 0]
            (fn (progress line)
              (let ([spans at] progress
-                   end (+ at (string/length line))
+                   end (+ at (count line))
                    face (line-face line))
                [(if face (conj spans [at end face]) spans) (inc end)])))))
 

@@ -93,7 +93,7 @@ recent live one in this buffer's project — as its buffer shows it, or nil."
 (def- tooltip-width 72)
 
 (defn- clipped (line)
-  (if (> (string/length line) tooltip-width)
+  (if (> (count line) tooltip-width)
     (str (string/substring line 0 (dec tooltip-width)) "…")
     line))
 

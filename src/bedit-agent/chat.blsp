@@ -200,11 +200,11 @@ queued behind a turn sent once it ends."
         buffer (assoc (end-of-buffer (insert-program-output base
                                        0
                                        text
-                                       {face-property [[0 (string/length text) :syntax/comment]]}))
+                                       {face-property [[0 (count text) :syntax/comment]]}))
                  :dir (:root session)
                  :agent-session (:id session)
-                 :transcript-end (string/length header)
-                 :input-start (string/length text)
+                 :transcript-end (count header)
+                 :input-start (count text)
                  :input-history []
                  :input-history-index nil
                  :input-draft nil))
@@ -264,7 +264,7 @@ anywhere else, the start of the line."
                  [(if (or (string/starts-with? line "» ") (string/starts-with? line "  ⏺ "))
                     (conj starts at)
                     starts)
-                   (+ at (string/length line) 1)]))))))
+                   (+ at (count line) 1)]))))))
 
 (defn- in-transcript? (buffer) (< (buffer-point buffer) (or (:input-start buffer) 0)))
 

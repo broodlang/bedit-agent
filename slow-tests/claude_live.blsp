@@ -21,7 +21,7 @@
       (let (chat (model/ed-current-buf m)
             text (editor/buffer/buffer-text (editor/buffer/widen chat))
             at (index-of text "◆ allow"))
-        (io/puts "QUESTION:" (if (>= at 0) (string/substring text at (string/length text)) "(none shown)"))
+        (io/puts "QUESTION:" (if (>= at 0) (string/substring text at (count text)) "(none shown)"))
         (let (asked (bedit-agent/permission/ask-waiting m))
           (io/puts "MINIBUFFER:" (map/get-in asked [:read-char :prompt]))
           (answer-questions ((map/get-in asked [:read-char :then]) (dissoc asked :read-char) "y")))))))

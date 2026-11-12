@@ -79,7 +79,7 @@ shown), and the buffer's commands."
   ;; not shown: a command itself (its first line, cut at 60 characters), else the tool and file
   (if (and (= (:tool request) "bash") (string? (:command request)))
     (let (line (first (string/split (string/trim (:command request)) "\n"))
-          cut (if (> (string/length line) 60) (str (string/substring line 0 59) "…") line))
+          cut (if (> (count line) 60) (str (string/substring line 0 59) "…") line))
       (str "bash `" cut "`"))
     (target session request)))
 
@@ -145,7 +145,7 @@ the window's `[cols rows]`, so a chat at its prompt scrolls to show the question
 (defn- replaced-once (text old new at)
   (str (string/substring text 0 at)
     new
-    (string/substring text (+ at (string/length old)) (string/length text))))
+    (string/substring text (+ at (count old)) (count text))))
 
 (defn- proposed (m request)
   ;; `[before after]`: the file an edit or a write changes, as bedit has it now and as the call
@@ -210,7 +210,7 @@ body and the keys — the faces, and each request's `[first-line last-line id]`.
   (let (asks (or (:agent-asks m) []))
     (if (empty? asks)
       (let (empty "Nothing is waiting for your answer.")
-        [(str empty "\n") [[0 (string/length empty) :syntax/comment]] []])
+        [(str empty "\n") [[0 (count empty) :syntax/comment]] []])
       (fold asks
         ["" [] []]
         (fn (progress ask)
@@ -221,10 +221,10 @@ body and the keys — the faces, and each request's `[first-line last-line id]`.
                                 [text spans]
                                 (fn (built [line face])
                                   (let ([so-far found] built
-                                        at (string/length so-far))
+                                        at (count so-far))
                                     [(str so-far line "\n")
                                       (if face
-                                        (conj found [at (+ at (string/length line)) face])
+                                        (conj found [at (+ at (count line)) face])
                                         found)]))))
             [grown
               faces

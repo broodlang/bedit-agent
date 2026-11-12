@@ -28,7 +28,7 @@ on disk (an open buffer's unsaved text), and edits go THROUGH bedit's buffers."
   "`text` cut to [[output-limit]] characters, its head and tail kept around a note.
 
     (bedit-agent/tools/clip \"short\")   ;=> \"short\""
-  (let (length (string/length text))
+  (let (length (count text))
     (if (<= length output-limit)
       text
       (let (half (math/quot output-limit 2))
@@ -73,8 +73,8 @@ for its answer — a tool result — or a failed result once `timeout-ms` (defau
     (bedit-agent/tools/inside? \"/src/xy\" [\"/src/x\"])   ;=> false"
   (any? roots
     (fn (root)
-      (let (bare (if (and (string/ends-with? root "/") (> (string/length root) 1))
-                   (string/substring root 0 (dec (string/length root)))
+      (let (bare (if (and (string/ends-with? root "/") (> (count root) 1))
+                   (string/substring root 0 (dec (count root)))
                    root))
         (or (= path bare) (string/starts-with? path (if (= bare "/") "/" (str bare "/"))))))))
 
