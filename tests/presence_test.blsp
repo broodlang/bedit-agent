@@ -50,7 +50,7 @@
 told to go: its pid."
   (let (parent (self)
         other (spawn (do
-                       (binding (*agent-live-dir* dir)
+                       (binding (*live-dir* dir)
                          (publish (model-with session)))
                        (written (self))
                        (send parent :published)
@@ -59,7 +59,7 @@ told to go: its pid."
 
 (describe "publishing a loop's sessions"
   (test "a loop's sessions are written, what another bedit is told of each, and read back"
-    (binding (*agent-live-dir* (live-here))
+    (binding (*live-dir* (live-here))
       (let (m (published-here (model-with chat))
             found (everywhere))
         (assert= (count found) 1)
@@ -69,7 +69,7 @@ told to go: its pid."
         ;; unchanged, nothing is asked of the writer
         (is (= m (publish m))))))
   (test "a loop with no sessions left has no file"
-    (binding (*agent-live-dir* (live-here))
+    (binding (*live-dir* (live-here))
       (published-here (assoc (published-here (model-with chat)) :agent-sessions {}))
       (assert= (everywhere) [])))
   (test "a loop that goes takes its file with it, though its program (and lock) lives on"
@@ -93,7 +93,7 @@ told to go: its pid."
 (describe "the sessions, as the tool and M-x agent-list tell them"
   (test "this project's sessions come first, each said to be you, in this bedit or in another"
     (let (dir (live-here))
-      (binding (*agent-live-dir* dir)
+      (binding (*live-dir* dir)
         (published-here (model-with chat (assoc terminal :root "/src/bedit" :id "a3")))
         (another-bedit dir terminal)
         (let (text (report (everywhere) (loop-name (self)) "/src/bedit" "a1")
@@ -109,7 +109,7 @@ told to go: its pid."
     (assert= (report [] nil "/src/bedit" nil) "No agent sessions are open."))
   (test "M-x agent-list shows every session; RET goes to one in this bedit, and says when it is elsewhere"
     (let (dir (live-here))
-      (binding (*agent-live-dir* dir)
+      (binding (*live-dir* dir)
         (let (m0 (pool/ed-open-buffer (ed-init (make-buffer "")) (make-buffer "" (:buffer chat)))
               m1 (publish (assoc m0 :agent-sessions {"a1" chat})))
           (written (self))

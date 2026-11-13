@@ -18,6 +18,10 @@ It is built on [agentkit](https://github.com/broodlang/agentkit), which knows no
 - **The editor loop never waits on the agent.** Work that might block (the disk, a process,
   the login check) runs in a handler or a spawned process, which sends the loop an event.
 - **Every tool request gets exactly one reply** (`workspace/reply`), failures included.
+- **To ask what code does, `nest eval`**, never a throwaway test file:
+  `nest eval --test --in bedit-agent/presence '(summary {:id "a1"})'` evaluates inside a module
+  (its private names visible) with a scratch home; `nest eval - <<'EOF' … EOF` takes several
+  forms from stdin. `.claude/skills/writing-brood` has the rest.
 - **Tests:** `nest test` (no network). `AGENT_LIVE_ROOT=/tmp/x nest run
   slow-tests/claude_live.blsp` spends one small real turn; run it after changing the
   tool/session path.

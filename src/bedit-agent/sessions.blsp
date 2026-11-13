@@ -27,7 +27,7 @@ agent's process (`start-worker`, `restart-worker`)."
 (def permission-timeout-ms (* 30 60 1000))
 
 ;; Where a session's MCP config file is written (a private directory); a test binds its own.
-(defdyn bedit-agent/sessions/*config-dir* nil)
+(defdyn *config-dir* nil)
 
 (defn sessions (m)
   "Every session on model `m`, id -> session."
@@ -193,7 +193,7 @@ Answers `mcp-server/start-http`'s `{:pid :port :token :url}`."
 
 (defn config-dir ()
   "The private directory sessions' MCP config files are written in."
-  (or bedit-agent/sessions/*config-dir* (path/join (projects/editor-state-dir) "agent")))
+  (or *config-dir* (path/join (projects/editor-state-dir) "agent")))
 
 (defn with-tools (session loop)
   "`session` with its tool server started ([[serve-tools]], going with `loop`) and the MCP

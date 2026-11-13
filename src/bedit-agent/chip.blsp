@@ -16,7 +16,8 @@
 time current."
   (:use model)
   (:use bedit-agent/sessions)
-  (:use bedit-agent/chat :only [current-session]))
+  (:use bedit-agent/chat :only [current-session])
+  (:use theme :only [*yellow* *teal* *red*])) ; the chip's colours (brood ADR-722)
 
 (defn- seconds (session)
   (let (started (:turn-started session))

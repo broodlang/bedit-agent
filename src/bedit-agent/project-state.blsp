@@ -16,11 +16,11 @@
   (:use projects :only [editor-state-dir persist-read-value persist-write!]))
 
 ;; Where the per-project state is kept; a test binds its own.
-(defdyn bedit-agent/project-state/*state-file* nil)
+(defdyn *state-file* nil)
 
 (defn state-file ()
   "The file holding each project's state."
-  (or bedit-agent/project-state/*state-file* (path/join (editor-state-dir) "agent-projects.blsp")))
+  (or *state-file* (path/join (editor-state-dir) "agent-projects.blsp")))
 
 (defn saved (root)
   "What is saved for project `root`: `{:config-dir …}`, or nil."

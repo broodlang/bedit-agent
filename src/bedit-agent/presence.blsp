@@ -25,13 +25,12 @@ M-x agent-list shows the same in `*agent: sessions*`."
   (:use projects :only [editor-state-dir persist-read-value persist-write!])
   (:use task :only [task])) ; the list is read off the loop
 
-;; Where the live files go; a test binds its own. Bare, as a `defdyn` name must be to be bound
-;; from outside (ADR-151), so named to be unique.
-(defdyn *agent-live-dir* nil)
+;; Where the live files go; a test binds its own.
+(defdyn *live-dir* nil)
 
 (defn live-dir ()
   "The directory every running bedit publishes its sessions in."
-  (or *agent-live-dir* (path/join (editor-state-dir) "agent" "live")))
+  (or *live-dir* (path/join (editor-state-dir) "agent" "live")))
 
 ;; How old an unheld lock file must be before a reader removes it: a bedit creates its lock
 ;; file a moment before it holds it, and a reader must not take the file out from under it.
