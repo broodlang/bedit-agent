@@ -20,7 +20,9 @@ Each starts a new session of that kind in this project; one already running stay
 switch to. `C-c a` (`M-x agent`) goes to this project's latest session, or starts one; it is the
 package's key, so bind it elsewhere, or away, in init.blsp's `:keys` (`"C-c a" nil`).
 `M-x agent-new` starts one under any profile; `M-x agent-switch` goes to any running session in
-any project.
+any project. `M-x agent-list` lists every session open on this machine, in this bedit and in every
+other one running: project, profile, whether it is working and what it is about (RET goes to one in
+this bedit). Agents see the same through the `sessions` tool.
 
 ### bedit's tools
 
@@ -35,6 +37,7 @@ any project.
 | `show` | open a file for you, at a line, in another window | `:read` |
 | `show_changes` | show you a diff of what **the agent** changed this session (against each file before its first edit) | `:read` |
 | `show_diff` | show you the uncommitted changes against git's HEAD | `:read` |
+| `sessions` | the other agent sessions open on this machine, in this project and every other, in every running bedit: who, working or idle, and what about | `:read` |
 
 Anything that reaches **outside the project** (and the profile's `:add-dirs`) asks, whatever the
 profile says. Ask "what did you change? show me" and the agent calls `show_changes`.
@@ -204,7 +207,7 @@ what bedit already shows in a file it just edited.
 In bedit, `M-x package-install RET bedit-agent` (or `i` on it in `M-x package-list`). bedit
 installs `agentkit`, the library it uses, from the hive beside it, loads it first, and binds
 `C-c a`. `M-x package-remove` takes both away again, and the key with them. Needs brood
-0.51.0 or later (`mcp-server`, ADR-711; `insert-program-output`, ADR-712).
+0.51.0 or later (`mcp-server`, ADR-711; `insert-program-output`, ADR-712; `file/lock`, ADR-721).
 
 Developing it, with bedit checked out beside it:
 

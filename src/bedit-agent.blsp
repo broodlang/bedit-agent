@@ -6,6 +6,7 @@ remove. docs/architecture.md has what each module is for."
   (:load bedit-agent/profiles)
   (:load bedit-agent/accounts)
   (:load bedit-agent/project-state)
+  (:load bedit-agent/presence)
   (:load bedit-agent/tools)
   (:load bedit-agent/sessions)
   (:load bedit-agent/workspace)

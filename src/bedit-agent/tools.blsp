@@ -281,7 +281,17 @@ request it makes of the loop names the session. Each tool that takes a path has 
        :handler (fn (args)
                   (ask-editor {:op :show
                                :path (absolute root (:path args))
-                               :line (if (int? (:line args)) (:line args) nil)}))}]))
+                               :line (if (int? (:line args)) (:line args) nil)}))}
+      {:name "sessions"
+       :risk :read
+       :description "The other agent sessions open on this machine — in this project and every other, in every running bedit: each one's project and profile, whether it is working now, and what it is about (its first message). Look before a large change, so you do not edit what another agent is editing."
+       :schema (object {} [])
+       ;; read from the live files each bedit keeps, here in the handler: no loop is asked
+       :handler (fn (_args)
+                  (succeeded (bedit-agent/presence/report (bedit-agent/presence/everywhere)
+                               (bedit-agent/presence/loop-name loop)
+                               root
+                               id)))}]))
 
 (defn catalogue (root loop names &optional (id nil))
   "The tools for a session in `root` with editor `loop`: those named in `names` (a profile's

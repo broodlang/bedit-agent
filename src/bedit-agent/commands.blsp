@@ -5,6 +5,7 @@
 ;; M-x agent              this project's latest session, or one under its default profile
 ;; M-x agent-new          another session here, under a profile you pick
 ;; M-x agent-switch       any running session, in any project
+;; M-x agent-list         every session on this machine, in every running bedit (presence.blsp)
 ;; M-x agent-account      which Claude account this project's sessions run as
 ;; M-x agent-profiles     the project's .bedit-agent.blsp (a starting one written if missing)
 ;; M-x agent-trust-project  let that file widen what its agents may do

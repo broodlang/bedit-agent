@@ -1,0 +1,128 @@
+;; Every agent session on this machine (`bedit-agent/presence`). A "bedit" here is an editor
+;; loop: each process that publishes is one, under a name of its own, into a live directory
+;; the test binds. Its writer writes off the loop; `written` is the barrier before a read. A
+;; bedit that has gone is a data file whose lock nobody holds.
+
+(defmodule presence-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/presence))
+
+(defn- live-here ()
+  (let (scratch (test/scratch-dir))
+    (if (nil? scratch)
+      (path/temp "bedit-agent-live-")
+      (path/join scratch (str "live-" (rand/token 4))))))
+
+(defn- model-with (& sessions)
+  {:agent-sessions (into {} (map sessions (fn (session) [(:id session) session])))})
+
+(def- chat
+  {:id "a1"
+   :root "/src/bedit"
+   :profile {:name "claude"}
+   :frontend :chat
+   :buffer "*agent: bedit/claude*"
+   :title "fix the hover"
+   :busy true
+   :status :working
+   :started 1
+   :turn-started 2
+   :worker :not-published})
+
+(def- terminal
+  {:id "a2"
+   :root "/src/hatch"
+   :profile {:name "claude-tui"}
+   :frontend :tui
+   :buffer "*agent: hatch/claude-tui*"
+   :busy false
+   :status :ready
+   :started 3})
+
+(defn- published-here (m)
+  "`(publish m)`, written."
+  (let (after (publish m)) (do (written (self)) after)))
+
+(defn- another-bedit (dir session)
+  "A process of its own — another bedit — that has published `session` in `dir` and waits to be
+told to go: its pid."
+  (let (parent (self)
+        other (spawn (do
+                       (binding (*agent-live-dir* dir)
+                         (publish (model-with session)))
+                       (written (self))
+                       (send parent :published)
+                       (receive (:go nil)))))
+    (receive (:published other) (after 5000 other))))
+
+(describe "publishing a loop's sessions"
+  (test "a loop's sessions are written, what another bedit is told of each, and read back"
+    (binding (*agent-live-dir* (live-here))
+      (let (m (published-here (model-with chat))
+            found (everywhere))
+        (assert= (count found) 1)
+        (assert= (:bedit (first found)) (loop-name (self)))
+        (assert= (:sessions (first found)) [(summary chat)])
+        (is (not (contains? (first (:sessions (first found))) :worker)))
+        ;; unchanged, nothing is asked of the writer
+        (is (= m (publish m))))))
+  (test "a loop with no sessions left has no file"
+    (binding (*agent-live-dir* (live-here))
+      (published-here (assoc (published-here (model-with chat)) :agent-sessions {}))
+      (assert= (everywhere) [])))
+  (test "a loop that goes takes its file with it, though its program (and lock) lives on"
+    (let (dir (live-here)
+          other (another-bedit dir terminal))
+      (assert= (count (everywhere dir)) 1)
+      (let (watch (monitor other))
+        (send other :go)
+        (receive ([:down ^watch _ _] nil) (after 5000 nil)))
+      ;; the writer saw its loop go; asking it again is the barrier for its last write
+      (written other)
+      (assert= (everywhere dir) [])))
+  (test "a file whose lock nobody holds is a bedit that has gone: swept, not read"
+    (let (dir (live-here))
+      (file/mkdir dir)
+      (file/spit (path/join dir "gone.blsp") "{:bedit \"gone\" :sessions []}")
+      (file/spit (path/join dir "gone.lock") "")
+      (assert= (everywhere dir) [])
+      (is (not (file/exists? (path/join dir "gone.blsp")))))))
+
+(describe "the sessions, as the tool and M-x agent-list tell them"
+  (test "this project's sessions come first, each said to be you, in this bedit or in another"
+    (let (dir (live-here))
+      (binding (*agent-live-dir* dir)
+        (published-here (model-with chat (assoc terminal :root "/src/bedit" :id "a3")))
+        (another-bedit dir terminal)
+        (let (text (report (everywhere) (loop-name (self)) "/src/bedit" "a1")
+              lines (string/split text "\n"))
+          (assert= (first lines) "In this project (/src/bedit):")
+          (is (includes? text "bedit/claude (chat) · working"))
+          (is (includes? text "\"fix the hover\" · you"))
+          (is (includes? text
+                "bedit/claude-tui (terminal) · idle · this bedit, *agent: hatch/claude-tui*"))
+          (is (includes? text "In other projects:"))
+          (is (includes? text "hatch/claude-tui (terminal) · idle · another bedit"))))))
+  (test "with nothing open, it says so"
+    (assert= (report [] nil "/src/bedit" nil) "No agent sessions are open."))
+  (test "M-x agent-list shows every session; RET goes to one in this bedit, and says when it is elsewhere"
+    (let (dir (live-here))
+      (binding (*agent-live-dir* dir)
+        (let (m0 (pool/ed-open-buffer (ed-init (make-buffer "")) (make-buffer "" (:buffer chat)))
+              m1 (publish (assoc m0 :agent-sessions {"a1" chat})))
+          (written (self))
+          (another-bedit dir terminal)
+          (let (listed (cmd-agent-list m1 nil)
+                text (buffer-text (ed-current-buf listed))
+                at-line (fn (m line)
+                          (let (buffer (ed-current-buf m))
+                            (ed-set-buf m
+                              (goto-char buffer (text/line->char (buffer-rope buffer) line)))))
+                here (cmd-agent-list-visit (at-line listed 2) nil)
+                elsewhere (cmd-agent-list-visit (at-line listed 3) nil))
+            (is (includes? text "bedit/claude (chat) · working"))
+            (is (includes? text "hatch/claude-tui (terminal) · idle · another bedit"))
+            (assert= (:name (ed-current-buf here)) (:buffer chat))
+            (is (includes? (:echo elsewhere) "in another bedit window"))))))))

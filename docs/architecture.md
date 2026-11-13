@@ -52,6 +52,7 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
 | `context` | `agent-send-region`/`-buffer`/`-file`/`-diagnostics` |
 | `menu` | the session menu (transient): permission toggles, model, effort, session commands |
 | `chip` | the mode-line chip and its one-second beat while a session works |
+| `presence` | every session on this machine: each loop publishes its own to `state/agent/live/` (off the loop, a writer process; a lock held while bedit runs), and readers skip a bedit that has gone; the `sessions` tool and `M-x agent-list` |
 
 ## The state, and where it lives
 
@@ -69,6 +70,7 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
 - **On disk.**
   - `state/agent-projects.blsp`: per project, the account, trust and past sessions.
   - `state/agent/mcp-*.json`: one per live session, mode 0600, removed when the session ends.
+  - `state/agent/live/<name>.blsp` and `.lock`: each running editor loop's sessions, a few fields each, and the lock that says its bedit still runs (brood's `file/lock`). A loop that ends removes its file; one whose bedit died is swept by the next reader.
   - The profiles files.
   - Claude Code's own session logs, which `resume` reads.
 

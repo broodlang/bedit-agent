@@ -1,0 +1,302 @@
+;; WHO ELSE IS AT WORK. Every agent session open on this machine, in this bedit and in every
+;; other one running, so a person can see them all (M-x agent-list) and an agent can see who
+;; else works in its project before it edits (the `sessions` tool).
+;;
+;; Each editor loop publishes its sessions to a file of its own in bedit's state,
+;; `state/agent/live/<name>.blsp`, a few fields a session (`summary`), rewritten only when
+;; one of them changed: a session started or ended, a turn began or finished, a session was
+;; named. It holds a lock on `<name>.lock` for as long as it runs (brood's `file/lock`), and
+;; the OS drops that lock however bedit exits, so a reader trusts a file only while its lock
+;; is held, and sweeps one whose bedit is gone. The lock is a file of its own: the data file
+;; is replaced whole on each write, and a lock on it would stay with the file it replaced.
+;;
+;; A second frame is a loop of its own, with sessions of its own, so the name is per loop.
+
+(defmodule bedit-agent/presence
+  "Every agent session open on this machine, across every running bedit: each loop publishes
+its own (`publish`, a post-step) to `state/agent/live/`, and `everywhere` reads them all back,
+skipping those whose bedit has gone. `report` is the text the `sessions` tool answers, and
+M-x agent-list shows the same in `*agent: sessions*`."
+  (:use model)
+  (:use interactive)
+  (:use editor/buffer)
+  (:use editor/keymap :only [keymap-bind])
+  (:use pool :only [ed-show-named])
+  (:use projects :only [editor-state-dir persist-read-value persist-write!])
+  (:use task :only [task])) ; the list is read off the loop
+
+;; Where the live files go; a test binds its own. Bare, as a `defdyn` name must be to be bound
+;; from outside (ADR-151), so named to be unique.
+(defdyn *agent-live-dir* nil)
+
+(defn live-dir ()
+  "The directory every running bedit publishes its sessions in."
+  (or *agent-live-dir* (path/join (editor-state-dir) "agent" "live")))
+
+;; How old an unheld lock file must be before a reader removes it: a bedit creates its lock
+;; file a moment before it holds it, and a reader must not take the file out from under it.
+(def- stale-lock-ms 60000)
+
+;; ---- publishing: what this loop's sessions are -------------------------------------------------
+;; The loop never touches the disk for it: a post-step compares, and a writer process of the
+;; loop's own writes, in the order it was asked.
+
+(defn loop-name (loop)
+  "The name editor loop `loop` publishes under, or nil before it has published."
+  (:name (registry/lookup :agent/presence loop)))
+
+(defn summary (session)
+  "What another bedit, or another agent, is told of `session`: who it is and what it is doing.
+
+    (:profile (bedit-agent/presence/summary {:id \"a1\" :root \"/src/x\" :profile {:name \"dev\"}}))   ;=> \"dev\""
+  {:id (:id session)
+   :root (:root session)
+   :profile (map/get-in session [:profile :name])
+   :frontend (:frontend session)
+   :buffer (:buffer session)
+   :title (:title session)
+   :busy (= true (:busy session))
+   :status (:status session)
+   :started (:started session)
+   :turn-started (:turn-started session)})
+
+(defn- published (m)
+  ;; the summaries of `m`'s sessions, oldest first
+  (vec (map (seq/sort-by (vals (or (:agent-sessions m) {})) :started) summary)))
+
+(defn write-live (dir name listed)
+  "Publish `listed` as loop `name`'s sessions in `dir`: its lock taken first (held from then on,
+by the program), the file written while it is held; none listed, the file goes. True when the
+disk says what `listed` does."
+  (let (data (path/join dir (str name ".blsp")))
+    (file/mkdir dir)
+    (cond
+      (failure? (file/lock (path/join dir (str name ".lock")))) false
+      (empty? listed) (do (when (file/exists? data) (file/rm data)) true)
+      else (do (persist-write! data {:bedit name :sessions listed}) true))))
+
+(defn- writer (loop name)
+  "Write editor loop `loop`'s live file, as `name`, in the order asked. A write refused the lock
+(another program asking `file/locked?` at that instant) is tried once more a moment later.
+When the loop goes the file goes with it: the lock is the program's, and outlives a loop that
+restarted."
+  (let (watch (monitor loop))
+    (letrec (serve (fn (dir)
+                     (receive
+                       ([:publish to listed] (do
+                                               (when (not (write-live to name listed))
+                                                 (proc/sleep 50)
+                                                 (write-live to name listed))
+                                               (serve to)))
+                       ([:written asker] (do (send asker [:written name]) (serve dir)))
+                       ([:down ^watch _ _] (do
+                                             (when dir (write-live dir name []))
+                                             (registry/remove :agent/presence loop))))))
+      (serve nil))))
+
+(defn- writer-of (loop)
+  ;; `{:name :writer}` for editor loop `loop`: made the first time it publishes
+  (or (registry/lookup :agent/presence loop)
+    (let (name (rand/token 6)
+          made {:name name :writer (spawn (writer loop name))})
+      (registry/put :agent/presence loop made)
+      made)))
+
+(defn publish (m)
+  "The post-step that keeps this loop's live file in step with its sessions: when what another
+bedit is told of them changed, the loop's writer is asked to write it; otherwise nothing — one
+summary a session and a comparison, a turn, and no disk."
+  (let (listed (published m))
+    (if (= listed (or (:agent-published m) []))
+      m
+      (do
+        (send (:writer (writer-of (self))) [:publish (live-dir) listed])
+        (assoc m :agent-published listed)))))
+
+(defn written (loop)
+  "Wait until editor loop `loop`'s writer has written everything asked of it so far — a
+barrier, as a synchronous call is: its mailbox is in order. A writer whose loop has gone writes
+its last and exits, which ends the wait too. nil when it has none."
+  (let (made (registry/lookup :agent/presence loop))
+    (when made
+      (let (watch (monitor (:writer made)))
+        (send (:writer made) [:written (self)])
+        (receive
+          ([:written _] (demonitor watch))
+          ([:down ^watch _ _] nil)
+          (after 5000 nil))
+        nil))))
+
+(register-post-step :agent-presence {:order 95 :run 'bedit-agent/presence/publish})
+
+;; ---- reading: every bedit's ------------------------------------------------------------------
+
+(defn- sweep (dir name)
+  ;; a bedit that is gone: its sessions file now, its lock file once it is old enough that
+  ;; no bedit can be about to take it
+  (let (data (path/join dir (str name ".blsp"))
+        lock (path/join dir (str name ".lock"))
+        changed (file/mtime lock))
+    (when (file/exists? data) (file/rm data))
+    (when (and changed (> (- (os/now) changed) stale-lock-ms) (not (file/locked? lock)))
+      (file/rm lock))))
+
+(defn everywhere (&optional (dir nil))
+  "Every running bedit's published sessions in `dir` (default [[live-dir]]), `[{:bedit name
+:sessions [summary …]} …]`: a file whose lock is not held is a bedit that has gone, and is swept
+rather than read. Reads the disk: call it off the loop."
+  (let (dir (or dir (live-dir)))
+    (if (not (file/dir? dir))
+      []
+      (let (names (into #{}
+                    (map (seq/filter (file/ls dir)
+                           (fn (file) (contains? #{".blsp" ".lock"} (path/extension file))))
+                      path/stem)))
+        (vec (seq/keep (sort (vec names))
+               (fn (name)
+                 (if (file/locked? (path/join dir (str name ".lock")))
+                   (let (value (persist-read-value (path/join dir (str name ".blsp")) nil))
+                     (when (and (map? value) (vector? (:sessions value))) value))
+                   (do (sweep dir name) nil)))))))))
+
+(defn- elapsed (since)
+  ;; how long ago `since` (epoch ms) was, briefly
+  (let (seconds (math/quot (- (os/now) since) 1000))
+    (cond
+      (< seconds 90) (str seconds "s")
+      (< seconds 5400) (str (math/quot seconds 60) "m")
+      else (str (math/quot seconds 3600) "h"))))
+
+(defn- state-of (session)
+  ;; what the session is doing, in a word or two
+  (cond
+    (:busy session)
+      (str "working"
+        (if (int? (:turn-started session))
+          (str " for " (elapsed (:turn-started session)))
+          ""))
+    (= (:status session) :ended) "ended"
+    (= (:status session) :starting) "starting"
+    else "idle"))
+
+(defn session-line (session where)
+  "One line for `session`: its project and profile, what it does, what it is about and
+`where` it is (`this bedit`, `another bedit`, `you`).
+
+    (bedit-agent/presence/session-line {:root \"/src/x\" :profile \"dev\" :frontend :chat :title \"fix it\"} \"you\")   ;=> \"x/dev (chat) · idle · \\\"fix it\\\" · you\""
+  (str (path/basename (or (:root session) "?"))
+    "/"
+    (:profile session)
+    " ("
+    (if (= (:frontend session) :tui) "terminal" "chat")
+    ") · "
+    (state-of session)
+    (if (string? (:title session)) (str " · \"" (:title session) "\"") "")
+    " · "
+    where))
+
+(defn- placed (bedits own caller)
+  ;; every session as `[summary where]`; `own` is this loop's name, `caller` a session id in it
+  (mapcat bedits
+    (fn (bedit)
+      (map (:sessions bedit)
+        (fn (session)
+          [session
+            (cond
+              (not (= (:bedit bedit) own)) "another bedit"
+              (= (:id session) caller) "you"
+              else (str "this bedit, " (:buffer session)))])))))
+
+(defn report (bedits own &optional (root nil) (caller nil))
+  "The sessions in `bedits` (`everywhere`'s) as text: those in project `root` first, then the
+rest by project. `own` is the asking loop's name, and `caller` the asking session's id, so
+each says whether it is you, in this bedit or in another one.
+
+    (bedit-agent/presence/report [] nil)   ;=> \"No agent sessions are open.\""
+  (let (all (placed bedits own caller)
+        here (seq/filter all (fn ([session _]) (= (:root session) root)))
+        elsewhere (seq/sort-by (seq/reject all (fn ([session _]) (= (:root session) root)))
+                    (fn ([session _]) (str (:root session))))
+        lines (fn (rows) (map rows (fn ([session where]) (str "- " (session-line session where))))))
+    (cond
+      (empty? all) "No agent sessions are open."
+      else
+        (string/join (append (if (or (nil? root) (empty? here))
+                               []
+                               (cons (str "In this project (" root "):") (lines here)))
+                       (if (empty? elsewhere)
+                         []
+                         (cons (if (nil? root) "Agent sessions:" "In other projects:")
+                           (lines elsewhere))))
+          "\n"))))
+
+;; ---- M-x agent-list ----------------------------------------------------------------------------
+
+(def list-name "*agent: sessions*")
+
+(defn- list-text (bedits own)
+  ;; `[text rows]`: the sessions as lines, and the session each line is about
+  (let (rows (vec (seq/sort-by (placed bedits own nil)
+                    (fn ([session _]) [(str (:root session)) (or (:started session) 0)])))
+        header "Agent sessions on this machine — RET goes to one in this bedit, g refreshes\n\n")
+    [(str header
+       (if (empty? rows)
+         "No agent sessions are open."
+         (string/join (map rows (fn ([session where]) (session-line session where))) "\n")))
+      rows]))
+
+(defn ed-list-read (m bedits)
+  "Show `bedits` (`everywhere`'s, read off the loop) in *agent: sessions*, each line knowing its
+session for RET."
+  (let ([text rows] (list-text (or bedits []) (loop-name (self)))
+        shown (ed-show-named (dissoc m :agent-list-job) list-name text :agent-sessions))
+    (ed-set-buf shown (assoc (ed-current-buf shown) :agent-list-rows rows))))
+
+(register-task-reply :agent-list-job 'bedit-agent/presence/ed-list-read nil nil)
+
+(defn- read-list (m)
+  ;; every bedit's sessions read in a task, shown when it answers (`ed-list-read`)
+  (let (dir (live-dir))
+    (cond
+      (:agent-list-job m) m
+      (ed-headless?) (ed-list-read m (everywhere dir))
+      else (assoc m :agent-list-job (task (fn () (everywhere dir)) {:timeout 5000})))))
+
+(defcommand cmd-agent-list
+  (m key)
+  "Every agent session open on this machine, in this bedit and every other one running: its
+project and profile, whether it is working, what it is about. RET on one in this bedit goes to
+its buffer; g refreshes."
+  (read-list m))
+
+(defcommand cmd-agent-list-refresh
+  (m key)
+  "In *agent: sessions*: read every bedit's sessions again."
+  (read-list m))
+
+(defcommand cmd-agent-list-visit
+  (m key)
+  "In *agent: sessions*: go to the session on this line, when it is in this bedit."
+  (let (buffer (ed-current-buf m)
+        line (- (text/char->line (buffer-rope buffer) (buffer-point buffer)) 2)
+        row (when (>= line 0) (nth (or (:agent-list-rows buffer) []) line nil))
+        [session where] (or row [nil nil])
+        index (when (and session (not (= where "another bedit")))
+                (ed-buffer-index-by-name m (:buffer session))))
+    (cond
+      (nil? session) (message m "no session on this line")
+      (nil? index) (message m (str (:buffer session) " is in another bedit window"))
+      else (pool/ed-select m index))))
+
+(def list-keymap
+  (-> {}
+    (keymap-bind [:enter] 'bedit-agent/presence/cmd-agent-list-visit)
+    (keymap-bind ["g"] 'bedit-agent/presence/cmd-agent-list-refresh)))
+
+(def list-layer
+  {:name 'agent-sessions
+   :doc "Every agent session on this machine: RET goes to one in this bedit, g refreshes."
+   :keymap list-keymap
+   :commands (modes/layer-commands list-keymap)})
+
+(modes/register-special-type :agent-sessions 'bedit-agent/presence/list-layer)
