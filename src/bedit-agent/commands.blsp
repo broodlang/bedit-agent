@@ -1,7 +1,7 @@
 ;; The agent commands: opening, finding and ending sessions, profiles and trust.
 ;;
-;; M-x claude             this project's chat session, or a new one (the `claude` profile)
-;; M-x claude-tui         this project's Claude Code terminal session, or a new one
+;; M-x claude             a new chat session in this project (the `claude` profile)
+;; M-x claude-tui         a new Claude Code terminal session in this project
 ;; M-x agent              this project's latest session, or one under its default profile
 ;; M-x agent-new          another session here, under a profile you pick
 ;; M-x agent-switch       any running session, in any project
@@ -33,26 +33,24 @@ for this project, in bedit's state — not in the project's committed files."
 
 ;; ---- opening sessions ------------------------------------------------------------------------
 
-(defn- open-profile (m name)
-  "This project's most recent session under profile `name`, selected; or a new one started
-under it — the profile the project defines by that name, else the built-in one."
-  (let ([root profiles told] (profiles-here m)
-        live (seq/filter (live-sessions told root)
-               (fn (session) (= (map/get-in session [:profile :name]) name))))
-    (if (empty? live) (start-asking told root profiles name) (select-session told (last live)))))
+(defn- start-profile (m name)
+  "A new session in this project under profile `name`: the profile the project defines by
+that name, else the built-in one. A session already running stays a buffer to switch to."
+  (let ([root profiles told] (profiles-here m))
+    (start-asking told root profiles name)))
 
 (defcommand cmd-claude
   (m key)
-  "Claude Code in a bedit chat buffer, for this project: its session, or a new one under the
-`claude` profile. Every tool it has is bedit's. (M-x claude-tui for Claude Code's own
-interface; M-x agent-new for another session.)"
-  (open-profile m "claude"))
+  "A new Claude Code session for this project in a bedit chat buffer, under the `claude`
+profile. Every tool it has is bedit's. (M-x claude-tui for Claude Code's own interface; M-x
+agent, or C-c a, back to the session you were in.)"
+  (start-profile m "claude"))
 
 (defcommand cmd-claude-tui
   (m key)
-  "Claude Code's own terminal interface for this project, bedit's tools added: its session, or
-a new one under the `claude-tui` profile. (M-x claude for the chat buffer.)"
-  (open-profile m "claude-tui"))
+  "A new Claude Code session for this project in Claude Code's own terminal interface, bedit's
+tools added, under the `claude-tui` profile. (M-x claude for the chat buffer.)"
+  (start-profile m "claude-tui"))
 
 (defcommand cmd-agent
   (m key)

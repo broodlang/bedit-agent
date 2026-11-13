@@ -9,16 +9,18 @@ cannot switch the provider), and the session's first event must say no API key i
 
 ## Two front ends, one set of profiles and tools
 
-| | `C-c a`, `M-x claude` (chat) | `M-x claude-tui` |
+| | `M-x claude` (chat) | `M-x claude-tui` |
 |---|---|---|
 | What you see | a bedit buffer: the transcript, your prompt below it | Claude Code's own interface, in a terminal buffer |
 | The agent's tools | **bedit's only**: every call goes through bedit | Claude Code's own, plus bedit's |
 | Permission | bedit asks in the minibuffer, the request shown above the prompt | Claude Code asks for its tools; bedit asks for its own |
 | What ran | written under each call in the transcript, with the diff | an edit is said in the echo area |
 
-Each opens this project's session of that kind, or starts one. `C-c a` is the package's key; bind
-it elsewhere, or away, in init.blsp's `:keys` (`"C-c a" nil`). `M-x agent-new` starts another
-under any profile; `M-x agent-switch` goes to any running session in any project.
+Each starts a new session of that kind in this project; one already running stays a buffer to
+switch to. `C-c a` (`M-x agent`) goes to this project's latest session, or starts one; it is the
+package's key, so bind it elsewhere, or away, in init.blsp's `:keys` (`"C-c a" nil`).
+`M-x agent-new` starts one under any profile; `M-x agent-switch` goes to any running session in
+any project.
 
 ### bedit's tools
 

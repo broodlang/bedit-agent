@@ -5,11 +5,11 @@
   (:use test))
 
 (describe "the plugin map"
-  (test "C-c a binds this project's chat, and compiles with no warning"
+  (test "C-c a binds this project's latest session, and compiles with no warning"
     (let (plugin (bedit-agent/bedit-plugin)
           compiled (userkeys/ed-user-keys (:keys plugin) {} "package bedit-agent"))
       (assert= (:warnings compiled) [])
-      ;; the command by its full name: the short `commands/cmd-claude` would read as bedit's own module
-      (assert= (:global compiled) [[[:ctrl-c "a"] 'bedit-agent/bedit-agent/commands/cmd-claude]])))
+      ;; the command by its full name: the short `commands/cmd-agent` would read as bedit's own module
+      (assert= (:global compiled) [[[:ctrl-c "a"] 'bedit-agent/bedit-agent/commands/cmd-agent]])))
   (test "its :on-retire names a function that is defined"
     (is (bound? (:on-retire (bedit-agent/bedit-plugin))))))
