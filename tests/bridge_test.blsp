@@ -123,3 +123,15 @@
       (assert= (bt-answer tag1) :none)
       (cmd-agent-allow declined nil)
       (assert= (bt-answer tag1) "allow"))))
+
+;; A session's tool server goes with the editor loop that owns it. Outside a loop,
+;; `ed-loop-address` answers the registered NAME `:editor`, which `monitor` does not take: the
+;; watcher died ("monitor: first argument must be a pid") and the server outlived the editor.
+(describe "the tool server goes with its editor loop"
+  :isolated (test "a loop given by its registered name still takes its server with it"
+    (let (loop (spawn (fn () (receive (:stop nil))))
+          _ (proc/register :bedit-agent-test-loop loop)
+          server (serve-tools "/tmp" :bedit-agent-test-loop {:tools []} "watch-1")
+          ref (monitor (:pid server)))
+      (exit loop :kill)
+      (assert= (receive ([:down ^ref _ _] :gone) (after 3000 :still-running)) :gone))))
