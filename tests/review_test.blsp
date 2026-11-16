@@ -65,6 +65,21 @@
         (assert= (rt-answer tag) :none)
         (assert= (count (:agent-asks outside)) 1)
         (is (includes? (buffer-text (ed-buf-at outside index)) "(outside the project)")))))
+  (test "a write naming a directory asks, and does not raise reading it for the preview"
+    ;; reported from the field: `file/slurp-bytes: /tmp/mc-2573/lib: Is a directory`, raised from
+    ;; `current-text` while the approval built its preview of the write
+    (let ([m dir _file] (rt-setup)
+          sub (path/join dir "lib"))
+      (file/mkdir sub)
+      (let ([queued tag] (rt-permission m
+                           {:tool "write"
+                            :risk :edit
+                            :paths [sub]
+                            :arguments {:file_path sub :content "x"}
+                            :what "write lib"}))
+        (assert= (rt-answer tag) :none)
+        (assert= (count (:agent-asks queued)) 1))
+      (assert= (bedit-agent/workspace/current-text m sub) "")))
   (test "no key typed anywhere else answers it: it waits in its buffer, the selection left put"
     (let ([m _dir _file] (rt-setup)
           before (buffer-name (ed-current-buf m))

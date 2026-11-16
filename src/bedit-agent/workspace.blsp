@@ -62,11 +62,14 @@ when nothing, or nothing current."
     (vec (mapcat buffers diagnostic-lines))))
 
 (defn current-text (m path)
-  "`path` as it is now: its buffer's text when bedit has one, else the disk's, else \"\"."
+  "`path` as it is now: its buffer's text when bedit has one, else the disk's, else \"\" — for a
+directory, a file it cannot read, or one that went between the check and the read too. An agent
+may name any path in an edit or a write, and the preview built from this must not raise."
   (let (index (buffer-index-for m path))
     (cond
       index (buffer-text (ed-buf-at m index))
-      (file/exists? path) (or (:text (ed-read-file path)) "")
+      (file/regular? path)
+        (or (:text (check-allow :discarded-catch (try (ed-read-file path) (catch _ nil)))) "")
       else "")))
 
 (defn diagnostics-state (m path)
