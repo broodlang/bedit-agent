@@ -172,12 +172,19 @@ just wrote: `\"current\"` once it has reported on it, `\"none\"` when nothing ch
 ;; ---- the tool server -----------------------------------------------------------------------------
 
 (defn- watch-loop (loop server)
-  ;; the tool server goes with the editor loop that owns it, and this watcher with the server
-  (spawn (let (loop-ref (monitor loop)
-               server-ref (monitor server))
-           (receive
-             ([:down ^loop-ref _ _] (exit server :kill))
-             ([:down ^server-ref _ _] nil)))))
+  ;; the tool server goes with the editor loop that owns it, and this watcher with the server.
+  ;; Outside a loop `ed-loop-address` answers the registered name `:editor`, which `monitor`
+  ;; does not take: resolve it, and with no such process there is nothing to go with.
+  (let (target (cond
+                 (pid? loop) loop
+                 (keyword? loop) (proc/whereis loop)
+                 else nil))
+    (when (pid? target)
+      (spawn (let (loop-ref (monitor target)
+                   server-ref (monitor server))
+               (receive
+                 ([:down ^loop-ref _ _] (exit server :kill))
+                 ([:down ^server-ref _ _] nil)))))))
 
 (defn serve-tools (root loop profile id)
   "Start session `id`'s tool server: bedit's tools for `root` (the profile's `:tools`), each
