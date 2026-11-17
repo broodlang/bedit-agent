@@ -125,16 +125,15 @@ allowed to set.
             ", which a project may set only once you trust it (M-x agent-trust-project)")))]))
 
 ;; check-allow: a chain of `:extends` is a few profiles long, and a cycle stops it
-(check-allow :non-tail-recursion
-  (defn- resolve-chain (profiles name seen)
-    (let (profile (get (:profiles profiles) name))
-      (cond
-        (nil? profile) nil
-        (contains? seen name) profile
-        (:extends profile)
-          (merge (or (resolve-chain profiles (:extends profile) (conj seen name)) {})
-            (dissoc profile :extends))
-        else profile))))
+(defn- resolve-chain (profiles name seen)
+  (let (profile (get (:profiles profiles) name))
+    (cond
+      (nil? profile) nil
+      (contains? seen name) profile
+      (:extends profile)
+        (merge (or (resolve-chain profiles (:extends profile) (conj seen name)) {})
+          (dissoc profile :extends))
+      else profile)))
 
 (defn resolve (profiles name)
   "Profile `name` of `profiles` with its `:extends` chain merged under it and `:name` set, or
