@@ -18,7 +18,7 @@ account menu), and the project's profiles and live sessions."
   (:use bedit-agent/project-state :only [config-dir-for saved-dir save-dir trusted?])
   ;; core's terminal defines an M-x `claude` of its own (bare `claude` in a terminal): loaded
   ;; first, so `commands`' is the one M-x runs — and core's comes back if this package goes
-  (:load terminal))
+  (:load shells/terminal))
 
 (defn project-root (m)
   "The project the selected buffer is in: its root, else the buffer's directory, else bedit's."
@@ -64,7 +64,7 @@ terminal opened running `command`, or the session refused, saying why."
           (message (drop-session m id) (str "agent: not started — " problem)))
       else
       ;; the label carries the session's own name, so a second TUI session is a second terminal
-        (let (opened (terminal/term-run m
+        (let (opened (shells/terminal/term-run m
                        (string/replace (:buffer session) "*" "")
                        (:root session)
                        command)

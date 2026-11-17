@@ -19,7 +19,7 @@ buffer for a new session."
   (:use editor/layers :only [set-buffer-type])
   (:use model)
   (:use pool :only [ed-open-buffer])
-  (:use comint :only [input-text])
+  (:use shells/comint :only [input-text])
   (:use interactive)
   (:use bedit-agent/sessions)
   (:use bedit-agent/transcript)
@@ -341,9 +341,9 @@ conversation."
     (keymap-bind [:ctrl-a] 'bedit-agent/chat/cmd-agent-beginning-of-line)
     (keymap-bind ["n"] 'bedit-agent/chat/cmd-agent-next-row)
     (keymap-bind ["p"] 'bedit-agent/chat/cmd-agent-previous-row)
-    (keymap-bind [:alt-p] 'comint/cmd-comint-previous-history)
-    (keymap-bind [:alt-n] 'comint/cmd-comint-next-history)
-    (keymap-bind [:ctrl-r] 'comint/cmd-comint-history-search)))
+    (keymap-bind [:alt-p] 'shells/comint/cmd-comint-previous-history)
+    (keymap-bind [:alt-n] 'shells/comint/cmd-comint-next-history)
+    (keymap-bind [:ctrl-r] 'shells/comint/cmd-comint-history-search)))
 
 (def agent-chat-layer
   {:name 'agent-chat
@@ -361,4 +361,4 @@ conversation."
 
 ;; over markdown-mode: the agent writes Markdown, and a fenced block is coloured as its language
 (modes/register-type :agent-chat
-  (list 'bedit-agent/chat/agent-chat-layer 'modes/markdown-mode-layer 'modes/text-mode-layer))
+  (list 'bedit-agent/chat/agent-chat-layer 'languages/markdown/markdown-mode-layer 'modes/text-mode-layer))
