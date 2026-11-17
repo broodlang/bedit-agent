@@ -19,7 +19,7 @@ buffer for a new session."
   (:use editor/layers :only [set-buffer-type])
   (:use model)
   (:use pool :only [ed-open-buffer])
-  (:use shells/comint :only [input-text])
+  (:use shells :only [input-text])
   (:use interactive)
   (:use bedit-agent/sessions)
   (:use bedit-agent/transcript)

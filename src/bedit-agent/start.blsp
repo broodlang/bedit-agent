@@ -64,7 +64,7 @@ terminal opened running `command`, or the session refused, saying why."
           (message (drop-session m id) (str "agent: not started — " problem)))
       else
       ;; the label carries the session's own name, so a second TUI session is a second terminal
-        (let (opened (shells/terminal/term-run m
+        (let (opened (shells/term-run m
                        (string/replace (:buffer session) "*" "")
                        (:root session)
                        command)
