@@ -361,4 +361,5 @@ conversation."
 
 ;; over markdown-mode: the agent writes Markdown, and a fenced block is coloured as its language
 (modes/register-type :agent-chat
-  (list 'bedit-agent/chat/agent-chat-layer 'languages/markdown/markdown-mode-layer 'modes/text-mode-layer))
+  (list 'bedit-agent/chat/agent-chat-layer
+    'languages/markdown/markdown-mode-layer 'modes/text-mode-layer))
