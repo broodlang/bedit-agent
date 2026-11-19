@@ -49,12 +49,10 @@
 
 (defn- file-reference (m buffer)
   ;; how the agent is pointed at a buffer's file: `@path`, under the project root
-  (let (root (str (project-root m) "/")
-        file (buffer-file buffer))
-    (cond
-      (nil? file) nil
-      (string/starts-with? file root) (str "@" (string/substring file (count root) (count file)))
-      else (str "@" file))))
+  (match (buffer-file buffer)
+    (nil nil)
+    ((str ^(project-root m) "/" relative) (str "@" relative))
+    (file (str "@" file))))
 
 (defcommand cmd-agent-send-region
   (m key)

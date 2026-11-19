@@ -82,15 +82,17 @@ restarted."
   (let (watch (monitor loop))
     (letrec (serve (fn (dir)
                      (receive
-                       ([:publish to listed] (do
-                                               (when (not (write-live to name listed))
-                                                 (proc/sleep 50)
-                                                 (write-live to name listed))
-                                               (serve to)))
+                       ([:publish to listed]
+                         (do
+                           (when (not (write-live to name listed))
+                             (proc/sleep 50)
+                             (write-live to name listed))
+                           (serve to)))
                        ([:written asker] (do (send asker [:written name]) (serve dir)))
-                       ([:down ^watch _ _] (do
-                                             (when dir (write-live dir name []))
-                                             (registry/remove :agent/presence loop))))))
+                       ([:down ^watch _ _]
+                         (do
+                           (when dir (write-live dir name []))
+                           (registry/remove :agent/presence loop))))))
       (serve nil))))
 
 (defn- writer-of (loop)
