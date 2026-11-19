@@ -126,7 +126,7 @@ its last and exits, which ends the wait too. nil when it has none."
           (after 5000 nil))
         nil))))
 
-(register-post-step :agent-presence {:order 95 :run 'bedit-agent/presence/publish})
+(register-post-step :agent-presence {:rank 95 :run 'bedit-agent/presence/publish})
 
 ;; ---- reading: every bedit's ------------------------------------------------------------------
 

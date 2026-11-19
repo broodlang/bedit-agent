@@ -152,7 +152,7 @@ ends the session — its questions declined, its agent and tool server stopped, 
         (stop-processes session)
         (drop-session (decline-asks m (:id session)) (:id session))))))
 
-(register-slot-keeper :agent-sessions {:order 15 :drop 'bedit-agent/commands/session-buffer-killed})
+(register-slot-keeper :agent-sessions {:rank 15 :drop 'bedit-agent/commands/session-buffer-killed})
 
 (defn kill-question (m buffer)
   "What C-x k says before killing a session's buffer (`model/register-kill-query`): that its

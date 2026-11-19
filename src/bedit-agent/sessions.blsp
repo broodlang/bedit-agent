@@ -171,15 +171,20 @@ just wrote: `\"current\"` once it has reported on it, `\"none\"` when nothing ch
 
 ;; ---- the tool server -----------------------------------------------------------------------------
 
-(defn- watch-loop (loop server)
-  ;; the tool server goes with the editor loop that owns it, and this watcher with the server.
-  ;; Outside a loop `ed-loop-address` answers the registered name `:editor`, which `monitor`
-  ;; does not take: resolve it, and with no such process there is nothing to go with.
+(defn- loop-pid (loop)
+  ;; the editor loop `loop` as a pid `monitor` takes, or nil: outside a loop `ed-loop-address`
+  ;; answers the registered name `:editor`, which `monitor` does not take, so it is resolved, and
+  ;; with no such process there is nothing to watch
   (let (target (cond
                  (pid? loop) loop
                  (keyword? loop) (proc/whereis loop)
                  else nil))
-    (when (pid? target)
+    (when (pid? target) target)))
+
+(defn- watch-loop (loop server)
+  ;; the tool server goes with the editor loop that owns it, and this watcher with the server
+  (let (target (loop-pid loop))
+    (when target
       (spawn (let (loop-ref (monitor target)
                    server-ref (monitor server))
                (receive
@@ -260,7 +265,7 @@ restart for a new model or effort keeps."
                                 :tools []
                                 :allowed-tools ["mcp__bedit"]
                                 :resume (:claude-session session)
-                                :owner loop)
+                                :owner (loop-pid loop))
     loop))
 
 (defn restart-worker (session loop)

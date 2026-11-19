@@ -416,7 +416,7 @@ else holds the keys ([[chat-ask]])."
     m
     (let (ask (chat-ask m)) (if ask (ask-in-minibuffer m ask) m))))
 
-(register-post-step :agent-ask {:order 90 :run 'bedit-agent/permission/ask-waiting})
+(register-post-step :agent-ask {:rank 90 :run 'bedit-agent/permission/ask-waiting})
 
 (defn macro-private? (m input)
   "Whether `input` answers an agent's request asked in the minibuffer, and so is no key for a
