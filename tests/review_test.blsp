@@ -354,13 +354,13 @@
   (test "a change waits for the checker to catch up, and no longer than it must"
     (let (answers (spawn (letrec (serve (fn (left)
                                           (receive
-                                            ([:agent-tool _ reply-to tag] (send reply-to
-                                                                            [:agent-tool-reply
-                                                                              tag
-                                                                              (agentkit/tool/succeeded (if (> left
-                                                                                                             0)
-                                                                                                         "stale"
-                                                                                                         "current"))])
+                                            ([:agent-tool _ reply-to tag]
+                                              (send reply-to
+                                                [:agent-tool-reply
+                                                  tag
+                                                  (agentkit/tool/succeeded (if (> left 0)
+                                                                             "stale"
+                                                                             "current"))])
                                               (serve (dec left))))))
                            (serve 2))))
       (assert= (settled-check answers "a1" "/x") "current")))

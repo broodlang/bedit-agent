@@ -15,12 +15,12 @@ transcript shows under an edit and a proposed change shows before you allow it.
     (map (string/split new "\n") (fn (line) [(str "+ " line) :syntax/string]))))
 
 (defn- line-face (line)
-  (cond
-    (or (string/starts-with? line "+++") (string/starts-with? line "---")) :syntax/comment
-    (string/starts-with? line "@@") :syntax/keyword
-    (string/starts-with? line "+") :syntax/string
-    (string/starts-with? line "-") :syntax/error
-    else nil))
+  (match line
+    ((or (str "+++" _) (str "---" _)) :syntax/comment)
+    ((str "@@" _) :syntax/keyword)
+    ((str "+" _) :syntax/string)
+    ((str "-" _) :syntax/error)
+    (_ nil)))
 
 (defn unified-lines (text)
   "Unified diff `text` as `[text face]` lines, each coloured as [[diff-spans]] colours it.
