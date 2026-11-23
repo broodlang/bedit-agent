@@ -254,8 +254,9 @@ anywhere else, the start of the line."
 ;; and previous turn or call — your message (`» `) or a tool row (`  ⏺ `). At the prompt they
 ;; type as any key does.
 
-(defn- row-starts (buffer)
-  ;; where each of the transcript's rows starts: your messages and the tool calls
+(defn row-starts (buffer)
+  "Where each of the transcript's rows starts in `buffer`, a chat or a watched session: the
+person's messages (`» `) and the tool calls (`  ⏺ `)."
   (let (text (string/substring (buffer-text buffer) 0 (or (:input-start buffer) 0)))
     (first (fold (string/split text "\n")
              [[] 0]
@@ -268,19 +269,22 @@ anywhere else, the start of the line."
 
 (defn- in-transcript? (buffer) (< (buffer-point buffer) (or (:input-start buffer) 0)))
 
+(defn ed-goto-row (m forward?)
+  "`m` with point on the transcript's next (or previous) row after (before) the line it is on, or
+a ding when there is none."
+  (let (buffer (ed-current-buf m)
+        here (line-start-of buffer (buffer-point buffer))
+        starts (row-starts buffer)
+        target (if forward?
+                 (seq/find starts (fn (start) (> start here)))
+                 (last (seq/filter starts (fn (start) (< start here))))))
+    (if (nil? target)
+      (ed-ding m (if forward? "no later turn" "no earlier turn"))
+      (ed-set-buf m (goto-char buffer target)))))
+
 (defn- to-row (m key forward?)
   ;; n / p: in the transcript, the next (or previous) row; at the prompt, the letter typed
-  (let (buffer (ed-current-buf m))
-    (if (not (in-transcript? buffer))
-      (typing/cmd-self-insert m key)
-      (let (here (line-start-of buffer (buffer-point buffer))
-            starts (row-starts buffer)
-            target (if forward?
-                     (seq/find starts (fn (start) (> start here)))
-                     (last (seq/filter starts (fn (start) (< start here))))))
-        (if (nil? target)
-          (ed-ding m (if forward? "no later turn" "no earlier turn"))
-          (ed-set-buf m (goto-char buffer target)))))))
+  (if (in-transcript? (ed-current-buf m)) (ed-goto-row m forward?) (typing/cmd-self-insert m key)))
 
 (defcommand cmd-agent-next-row
   (m key)

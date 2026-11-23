@@ -22,7 +22,8 @@ package's key, so bind it elsewhere, or away, in init.blsp's `:keys` (`"C-c a" n
 `M-x agent-new` starts one under any profile; `M-x agent-switch` goes to any running session in
 any project. `M-x agent-list` lists every session open on this machine, in this bedit and in every
 other one running: project, profile, whether it is working and what it is about (RET goes to one in
-this bedit). Agents see the same through the `sessions` tool.
+this bedit). Below them it lists every other Claude Code session that worked in the last 12 hours,
+wherever it runs, and RET on one watches it (below). Agents see bedit's through the `sessions` tool.
 
 ### bedit's tools
 
@@ -133,6 +134,23 @@ In any buffer of a project with a session:
 - `✦ dev · 41k · 5h 62%` when idle: the context used and the plan window.
 
 Otherwise a click goes to the session. Hover it for the model, effort, account, plan windows and "always" answers.
+
+## Watching a session bedit did not start
+
+Claude Code writes every session to a log as it works, so bedit can show one started anywhere: in a
+terminal, in another editor, under any of your accounts (`~/.claude`, `~/.claude-work`, …).
+`M-x agent-watch` offers those that worked in the last 12 hours, working ones first, and opens the
+chosen one in a read-only `*watch: <project> <id>*` buffer. It shows the conversation as a chat
+does (your prompts, the agent's text, each tool call and its answer) and follows the tail as new
+lines arrive. The last half megabyte of the log is shown when it opens.
+
+- **f** follows the agent's files: while you are in the watch buffer, each file it reads or changes
+  is shown in the other window at the place it touched, once the tool has answered. A file open in
+  bedit and unedited is reverted first, so the change is there.
+- **n** / **p** move between turns and tool calls; **RET** on a `path:line` opens it.
+- **q** stops watching. The session itself is not touched: watching only reads its log.
+
+Needs agentkit's `claude-log` (brood ADR-780, `file/slurp-bytes-from`).
 
 ## Handing the agent context
 

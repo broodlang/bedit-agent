@@ -1,0 +1,464 @@
+;; WATCHING an agent bedit did not start. Claude Code logs every session as it goes, wherever it
+;; runs — a terminal, another editor, another account (`agentkit/claude-log`) — so bedit can show
+;; any of them as it works, read-only: `M-x agent-watch` picks one, and its *watch:* buffer is
+;; written by the same transcript writer as a chat (`bedit-agent/transcript`) from a follower
+;; process that reads only what the log gained (brood's `file/slurp-bytes-from`). The window
+;; follows the tail as a compile buffer does.
+;;
+;; FOLLOW (`f`): while you are in the watch buffer, each file the agent reads or changes is
+;; shown in the other window at the place it touched, once the tool has answered (the call is
+;; logged before it runs). A file open and unchanged in bedit is reverted first, so the change
+;; is there to see.
+;;
+;; M-x agent-list lives here too: the sessions bedit runs (`bedit-agent/presence`) and, below
+;; them, every other Claude Code session that worked lately; RET on one of those watches it.
+
+(defmodule bedit-agent/watch
+  "Watching any Claude Code session on this machine from its log: `M-x agent-watch`, its
+read-only *watch:* buffer that follows the tail and, with `f`, the files the agent touches;
+and `M-x agent-list`, every agent session, bedit's and the rest."
+  (:use editor/buffer)
+  (:use model)
+  (:use interactive)
+  (:use editor/keymap :only [keymap-bind])
+  (:use editor/layers :only [set-buffer-type])
+  (:use editor/buffer-file :only [buffer-file-changed?])
+  (:use pool :only [ed-show-named ed-pop-to-file ed-name-prompt])
+  (:use task :only [task])
+  (:use bedit-agent/presence :only [everywhere loop-name session-line live-dir])
+  (:use bedit-agent/workspace :only [buffer-index-for])
+  (:use bedit-agent/transcript :only [ed-chat-write write-event transcript-line face-property])
+  (:use bedit-agent/chat :only [chat-line-loc ed-goto-row]))
+
+;; ---- the watches on the model ------------------------------------------------------------------
+;; `:agent-watches` is buffer name -> `{:buffer :file :follower :root :title :config-dir :follow?
+;; :working? :caught-up? :pending}`: `:pending` the file calls whose answer has not been read
+;; (id -> `{:name :input}`), `:caught-up?` false until the log's backlog is written, so follow
+;; never replays it.
+
+(defn watches (m)
+  "Every watch on `m`, buffer name -> watch."
+  (or (:agent-watches m) {}))
+
+(defn- put-watch (m watch)
+  (assoc m :agent-watches (assoc (watches m) (:buffer watch) watch)))
+
+(defn- by-follower (m follower)
+  (seq/find (vals (watches m)) (fn (watch) (= (:follower watch) follower))))
+
+;; How much of a log a new watch shows: the last half megabyte, so a day-long session opens at
+;; once. The first line read from inside it is half a line, which the reader drops.
+(def backlog-bytes 524288)
+
+(defn buffer-name-for (entry)
+  "The watch buffer of session log `entry` (`agentkit/claude-log/sessions`'s).
+
+    (bedit-agent/watch/buffer-name-for {:cwd \"/src/app\" :id \"0d3f9a11-22\"})   ;=> \"*watch: app 0d3f9a11*\""
+  (str "*watch: "
+    (path/basename (or (:cwd entry) "?"))
+    " "
+    (string/substring (str (:id entry)) 0 8)
+    "*"))
+
+(defn- header (entry)
+  (str "Watching Claude Code in "
+    (path/abbreviate (or (:cwd entry) "?"))
+    (if (:config-dir entry) (str " · " (path/abbreviate (:config-dir entry))) "")
+    " · "
+    (:title entry)
+    "\nread-only · n / p turns · RET opens a path:line · f follows the files it touches · q stops watching\n"))
+
+(defn- watch-session (watch)
+  ;; what the transcript writer is told of the session it writes for
+  {:root (:root watch) :profile {:name "terminal"} :config-dir (:config-dir watch)})
+
+(defn ed-watch (m entry &optional (follower nil))
+  "`m` with session log `entry` watched in its own buffer, selected — an existing watch of it is
+selected again. `follower` is the process reading the log; by default one is started for this
+loop, from the last `backlog-bytes` of the log."
+  (let (name (buffer-name-for entry)
+        index (ed-buffer-index-by-name m name))
+    (if index
+      (pool/ed-select m index)
+      (let (text (header entry)
+            base (set-buffer-type (make-buffer "" name) :agent-watch)
+            buffer (assoc (insert-program-output base
+                            0
+                            text
+                            {face-property [[0 (count text) :syntax/comment]]})
+                     :dir (:cwd entry)
+                     :agent-watch name
+                     :transcript-end (count text)
+                     :input-start (count text))
+            offset (math/max 0 (- (or (:size entry) (file/size (:file entry)) 0) backlog-bytes))
+            reader (or follower (agentkit/claude-log/follow (:file entry) (self) {:offset offset})))
+        (pool/ed-open-buffer (put-watch m
+                               {:buffer name
+                                :file (:file entry)
+                                :follower reader
+                                :root (:cwd entry)
+                                :title (:title entry)
+                                :config-dir (:config-dir entry)
+                                :follow? false
+                                :working? (= true (:working? entry))
+                                :caught-up? false
+                                :pending {}})
+          (end-of-buffer buffer))))))
+
+;; ---- what the follower read --------------------------------------------------------------------
+
+(def- file-tools #{"Read" "Edit" "MultiEdit" "Write" "NotebookEdit" "read" "edit" "write" "show"})
+
+(defn file-of (input)
+  "The file a tool call's `input` is about, or nil: Claude Code's own tools name it `file_path`
+(`notebook_path`), bedit's `path`.
+
+    (bedit-agent/watch/file-of {:file_path \"/src/a.txt\" :old_string \"x\"})   ;=> \"/src/a.txt\""
+  (let (path (or (:file_path input) (:notebook_path input) (:path input)))
+    (if (string? path) path nil)))
+
+(defn- tool-of (name)
+  (last (string/split (str name) "__")))
+
+(defn target-of (call root)
+  "Where follow shows file call `call` (`{:name :input}`) once it has answered: `{:path :line
+:find}` — the line it read from, or the text it wrote to look for — or nil for a call about no
+file.
+
+    (bedit-agent/watch/target-of {:name \"Edit\" :input {:file_path \"a.txt\" :new_string \"y\"}} \"/src\")   ;=> {:path \"/src/a.txt\" :line 1 :find \"y\"}"
+  (let (input (or (:input call) {})
+        path (file-of input))
+    (if (or (nil? path) (not (contains? file-tools (tool-of (:name call)))))
+      nil
+      {:path (path/absolute path (or root "/"))
+       :line (let (line (or (:offset input) (:line input))) (if (int? line) (math/max 1 line) 1))
+       :find (let (written (or (:new_string input)
+                             (:new_string (first (or (:edits input) [])))
+                             (:new input)))
+               (if (and (string? written) (not (string/blank? written))) written nil))})))
+
+(defn- step (watch event)
+  ;; the watch after one event: its working state, its file calls waiting for an answer, and
+  ;; the file follow would show (`:target`)
+  (let ([kind payload] event)
+    (case kind
+      :prompt (assoc watch :working? true)
+      :turn-done (assoc watch :working? false)
+      :title (assoc watch :title payload)
+      :tool-use
+        (assoc watch
+          :working? true
+          :pending
+            (if (file-of (:input payload))
+              (assoc (:pending watch) (:id payload) {:name (:name payload) :input (:input payload)})
+              (:pending watch)))
+      :tool-result
+        (let (call (get (:pending watch) (:id payload)))
+          (assoc watch
+            :pending (dissoc (:pending watch) (:id payload))
+            :target
+              (if (and call (not (:error? payload)))
+                (or (target-of call (:root watch)) (:target watch))
+                (:target watch))))
+      watch)))
+
+(defn- select-pane-of (m index)
+  ;; `m` with the pane showing pool buffer `index` selected, when one does
+  (let (layout (:layout m)
+        path (seq/find (editor/pane/pane-leaf-paths layout)
+               (fn (path) (= (:buffer (editor/pane/pane-payload-at layout path)) index))))
+    (if path (assoc m :layout (editor/pane/pane-select-path layout path)) m)))
+
+(defn- fresh (m path)
+  ;; `m` with the buffer of `path`, when it is open, unedited and older than the file, read again:
+  ;; the agent's change is what follow came to show
+  (let (index (buffer-index-for m path)
+        buffer (if index (ed-buf-at m index) nil))
+    (if (and buffer (buffer-file-changed? buffer) (not (buffer-modified? buffer)))
+      (autorevert/ed-revert-at m index)
+      m)))
+
+(defn- at-text (m target)
+  ;; `m` with point on the text the call wrote, in the selected buffer, when it is there
+  (let (buffer (ed-current-buf m)
+        found (if (:find target) (index-of (buffer-text buffer) (:find target)) -1))
+    (if (< found 0) m (ed-set-buf m (goto-char buffer found)))))
+
+(defn ed-show-target (m name target)
+  "`m` with `target` (`target-of`'s) shown in a window beside watch buffer `name`, which stays
+selected."
+  (let (shown (ed-pop-to-file (fresh m (:path target))
+                (:path target)
+                (:line target)
+                (fn (popped) (at-text popped target)))
+        index (ed-buffer-index-by-name shown name))
+    (if index (select-pane-of shown index) shown)))
+
+(defn- following? (m watch)
+  ;; follow moves a window only while you are in the watch buffer, after its backlog
+  (and (:follow? watch) (:caught-up? watch) (= (buffer-name (ed-current-buf m)) (:buffer watch))))
+
+(defn ed-ev-agent-log (m input _textrows cols rows)
+  "What a watch's follower read (`[:agent-log follower {:events :reset?}]`): written into its
+transcript, its state stepped, and — when it follows — the last file a call touched shown. A
+follower whose watch is gone is stopped."
+  (let ([_ follower read] input
+        watch (by-follower m follower))
+    (if (nil? watch)
+      (do (send follower [:stop]) m)
+      (let (events (or (:events read) [])
+            session (watch-session watch)
+            written (ed-chat-write m
+                      (:buffer watch)
+                      (fn (buffer)
+                        (fold events
+                          (if (:reset? read)
+                            (transcript-line buffer
+                              "── the log was replaced: read again from its start ──")
+                            buffer)
+                          (fn (so-far [kind payload]) (write-event so-far kind payload session))))
+                      [cols rows])
+            stepped (fold events (dissoc watch :target) step)
+            stored (put-watch written (assoc (dissoc stepped :target) :caught-up? true)))
+        (if (and (:target stepped) (following? stored watch))
+          (ed-show-target stored (:buffer watch) (:target stepped))
+          stored)))))
+
+(register-event-handler :agent-log 'bedit-agent/watch/ed-ev-agent-log)
+
+(defn watch-buffer-killed (m killed)
+  "The slot keeper's `:drop`: a watch buffer being killed stops its follower and drops the watch."
+  (let (name (buffer-name (ed-buf-at m killed))
+        watch (get (watches m) name))
+    (if (nil? watch)
+      m
+      (do
+        (send (:follower watch) [:stop])
+        (assoc m :agent-watches (dissoc (watches m) name))))))
+
+(register-slot-keeper :agent-watches {:rank 16 :drop 'bedit-agent/watch/watch-buffer-killed})
+
+;; ---- the watch buffer's commands ---------------------------------------------------------------
+
+(defn- current-watch (m)
+  (get (watches m) (buffer-name (ed-current-buf m))))
+
+(defcommand cmd-agent-watch-follow
+  (m key)
+  "f in a watch buffer: follow the agent's files, or stop. While you are in the watch buffer, each
+file it reads or changes is shown in the other window at the place it touched."
+  (let (watch (current-watch m))
+    (if (nil? watch)
+      (message m "not a watch buffer")
+      (let (on? (not (:follow? watch)))
+        (message (put-watch m (assoc watch :follow? on?))
+          (if on? "following the agent's files" "no longer following its files"))))))
+
+(defcommand cmd-agent-watch-next-row
+  (m key)
+  "n in a watch buffer: the next turn or tool call."
+  (ed-goto-row m true))
+
+(defcommand cmd-agent-watch-previous-row
+  (m key)
+  "p in a watch buffer: the previous turn or tool call."
+  (ed-goto-row m false))
+
+(defcommand cmd-agent-watch-return
+  (m key)
+  "RET in a watch buffer: on a `path:line`, open it in another window; anywhere else, go to the
+end, where the window follows the tail."
+  (let (buffer (ed-current-buf m))
+    (if (chat-line-loc buffer (buffer-current-line buffer))
+      (commands/cmd-visit-location m key)
+      (ed-set-buf m (end-of-buffer buffer)))))
+
+(def watch-keymap
+  (-> {}
+    (keymap-bind [:enter] 'bedit-agent/watch/cmd-agent-watch-return)
+    (keymap-bind ["n"] 'bedit-agent/watch/cmd-agent-watch-next-row)
+    (keymap-bind ["p"] 'bedit-agent/watch/cmd-agent-watch-previous-row)
+    (keymap-bind ["f"] 'bedit-agent/watch/cmd-agent-watch-follow)
+    (keymap-bind ["q"] 'pool/cmd-kill-current-buffer)))
+
+(def watch-layer
+  {:name 'agent-watch
+   :doc "A Claude Code session watched from its log: read-only, following its tail."
+   :keymap watch-keymap
+   :commands (modes/layer-commands watch-keymap)
+   :line-loc 'bedit-agent/chat/chat-line-loc
+   :electric-pair false
+   :read-only-hint "a watched session is read-only — n / p move between turns, f follows its files, q stops"
+   :long-lines :wrap})
+
+(modes/register-type :agent-watch
+  (list 'bedit-agent/watch/watch-layer
+    'languages/markdown/markdown-mode-layer 'modes/text-mode-layer))
+
+;; ---- finding the sessions ----------------------------------------------------------------------
+
+;; How far back M-x agent-watch and M-x agent-list look for sessions that are not bedit's.
+(def recent-ms (* 12 60 60 1000))
+
+(defn- age (at)
+  (let (seconds (math/quot (- (os/now) (or at 0)) 1000))
+    (cond
+      (< seconds 90) (str seconds "s ago")
+      (< seconds 5400) (str (math/quot seconds 60) "m ago")
+      else (str (math/quot seconds 3600) "h ago"))))
+
+(defn log-line (entry)
+  "One line for session log `entry`: its project, whether it is working, what it is about, how
+long ago it last wrote and under which account.
+
+    (string/starts-with? (bedit-agent/watch/log-line {:cwd \"/src/app\" :title \"Fix it\" :working? true :at 0}) \"app (Claude Code) · working · \\\"Fix it\\\"\")   ;=> true"
+  (str (path/basename (or (:cwd entry) "?"))
+    " (Claude Code) · "
+    (if (:working? entry) "working" "idle")
+    " · \""
+    (:title entry)
+    "\" · "
+    (age (:at entry))
+    (if (:config-dir entry) (str " · " (path/abbreviate (:config-dir entry))) "")))
+
+(defn- not-bedit-own (logs bedits)
+  ;; the logs of sessions no bedit runs: a chat's own log is the chat
+  (let (own (into #{} (seq/keep (mapcat bedits :sessions) :claude-session)))
+    (vec (seq/reject logs (fn (entry) (contains? own (:id entry)))))))
+
+;; The Claude Code account directories whose logs are read: every one on this machine by default
+;; (`agentkit/claude-log/config-dirs`); a test binds its own. Read on the loop, passed to the task.
+(defdyn *claude-dirs* nil)
+
+(defn- read-everything (dir claude-dirs)
+  ;; run off the loop: every bedit's sessions and every recent Claude Code log
+  (let (bedits (everywhere dir))
+    {:bedits bedits
+     :logs (not-bedit-own (agentkit/claude-log/sessions {:within recent-ms :config-dirs claude-dirs})
+             bedits)}))
+
+;; ---- M-x agent-watch ---------------------------------------------------------------------------
+
+(defn- watch-order (logs)
+  ;; the ones working first, then the most recent
+  (append (seq/filter logs :working?) (seq/reject logs :working?)))
+
+(defn ed-watch-read (m found)
+  "M-x agent-watch's read landed: a menu of the sessions it found, working ones first."
+  (let (logs (watch-order (or (:logs found) []))
+        cleared (dissoc m :agent-watch-job))
+    (if (empty? logs)
+      (message cleared "no other Claude Code session has worked in the last 12 hours")
+      (assoc cleared
+        :minibuffer
+          (ed-name-prompt "Watch session: "
+            (map logs log-line)
+            (fn (answered text)
+              (let (entry (seq/find logs (fn (candidate) (= (log-line candidate) text))))
+                (if entry (ed-watch answered entry) answered))))))))
+
+(register-task-reply :agent-watch-job 'bedit-agent/watch/ed-watch-read nil "finding sessions")
+
+(defcommand cmd-agent-watch
+  (m key)
+  "Watch a Claude Code session that bedit did not start — one in a terminal, in another editor,
+under any account — as it works: a menu of those that worked in the last 12 hours, working ones
+first. Its *watch:* buffer shows the conversation and follows its tail; f follows the files it
+touches."
+  (let (dir (live-dir)
+        claude-dirs *claude-dirs*)
+    (cond
+      (:agent-watch-job m) m
+      (ed-headless?) (ed-watch-read m (read-everything dir claude-dirs))
+      else
+        (assoc m :agent-watch-job (task (fn () (read-everything dir claude-dirs)) {:timeout 10000})))))
+
+;; ---- M-x agent-list ----------------------------------------------------------------------------
+
+(def list-name "*agent: sessions*")
+
+(defn- placed (bedits own)
+  ;; every bedit session as `[summary where]`; `own` is this loop's name
+  (mapcat bedits
+    (fn (bedit)
+      (map (:sessions bedit)
+        (fn (session)
+          [session
+            (if (= (:bedit bedit) own) (str "this bedit, " (:buffer session)) "another bedit")])))))
+
+(defn- list-text (found own)
+  ;; `[text rows]`: the sessions as lines, and what each line is about: `[session where]` for a
+  ;; bedit's, `[log :log]` for the rest
+  (let (bedit-rows (vec (seq/sort-by (placed (or (:bedits found) []) own)
+                          (fn ([session _]) [(str (:root session)) (or (:started session) 0)])))
+        log-rows (vec (map (watch-order (or (:logs found) [])) (fn (entry) [entry :log])))
+        rows (into bedit-rows log-rows)
+        header "Agent sessions on this machine — RET goes to one, or watches it; g refreshes\n\n")
+    [(str header
+       (if (empty? rows)
+         "No agent sessions are open."
+         (string/join (map rows
+                        (fn ([session where])
+                          (if (= where :log) (log-line session) (session-line session where))))
+           "\n")))
+      rows]))
+
+(defn ed-list-read (m found)
+  "Show what was read off the loop — every bedit's sessions and the other Claude Code logs — in
+*agent: sessions*, each line knowing its session for RET."
+  (let ([text rows] (list-text (or found {}) (loop-name (self)))
+        shown (ed-show-named (dissoc m :agent-list-job) list-name text :agent-sessions))
+    (ed-set-buf shown (assoc (ed-current-buf shown) :agent-list-rows rows))))
+
+(register-task-reply :agent-list-job 'bedit-agent/watch/ed-list-read nil nil)
+
+(defn- read-list (m)
+  (let (dir (live-dir)
+        claude-dirs *claude-dirs*)
+    (cond
+      (:agent-list-job m) m
+      (ed-headless?) (ed-list-read m (read-everything dir claude-dirs))
+      else
+        (assoc m :agent-list-job (task (fn () (read-everything dir claude-dirs)) {:timeout 10000})))))
+
+(defcommand cmd-agent-list
+  (m key)
+  "Every agent session on this machine: those in this bedit and every other one running — its
+project and profile, whether it is working, what it is about — and below them every other Claude
+Code session that worked lately. RET goes to one in this bedit, or watches one that is not
+bedit's; g refreshes."
+  (read-list m))
+
+(defcommand cmd-agent-list-refresh
+  (m key)
+  "In *agent: sessions*: read every session again."
+  (read-list m))
+
+(defcommand cmd-agent-list-visit
+  (m key)
+  "In *agent: sessions*: go to the session on this line when it is in this bedit, or watch it
+when no bedit runs it."
+  (let (buffer (ed-current-buf m)
+        line (- (text/char->line (buffer-rope buffer) (buffer-point buffer)) 2)
+        row (when (>= line 0) (nth (or (:agent-list-rows buffer) []) line nil))
+        [session where] (or row [nil nil])
+        index (when (and session (string? where) (not (= where "another bedit")))
+                (ed-buffer-index-by-name m (:buffer session))))
+    (cond
+      (nil? session) (message m "no session on this line")
+      (= where :log) (ed-watch m session)
+      (nil? index) (message m (str (:buffer session) " is in another bedit window"))
+      else (pool/ed-select m index))))
+
+(def list-keymap
+  (-> {}
+    (keymap-bind [:enter] 'bedit-agent/watch/cmd-agent-list-visit)
+    (keymap-bind ["g"] 'bedit-agent/watch/cmd-agent-list-refresh)))
+
+(def list-layer
+  {:name 'agent-sessions
+   :doc "Every agent session on this machine: RET goes to one in this bedit or watches another, g refreshes."
+   :keymap list-keymap
+   :commands (modes/layer-commands list-keymap)})
+
+(modes/register-special-type :agent-sessions 'bedit-agent/watch/list-layer)

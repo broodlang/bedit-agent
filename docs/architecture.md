@@ -49,10 +49,11 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
 | `start` | starting a session in either front end; the account question; a project's profiles and live sessions |
 | `commands` | `M-x claude`, `claude-tui`, `agent*`; what ends a session when its buffer goes; the exit query |
 | `resume` | `M-x agent-resume`: a past chat replayed from Claude Code's log and continued |
+| `watch` | `M-x agent-watch`: any Claude Code session followed from its log (agentkit's `claude-log` follower), read-only, `f` following its files; `M-x agent-list`, bedit's sessions and the rest |
 | `context` | `agent-send-region`/`-buffer`/`-file`/`-diagnostics` |
 | `menu` | the session menu (transient): permission toggles, model, effort, session commands |
 | `chip` | the mode-line chip and its one-second beat while a session works |
-| `presence` | every session on this machine: each loop publishes its own to `state/agent/live/` (off the loop, a writer process; a lock held while bedit runs), and readers skip a bedit that has gone; the `sessions` tool and `M-x agent-list` |
+| `presence` | every session on this machine: each loop publishes its own to `state/agent/live/` (off the loop, a writer process; a lock held while bedit runs), and readers skip a bedit that has gone; the `sessions` tool |
 
 ## The state, and where it lives
 
@@ -64,6 +65,8 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
   - `:worker` (agentkit's pid) and `:claude-session`;
   - `:always` (`{:tools :commands}`), `:originals` (path → text before the first edit), `:queued`;
   - `:title :turn-started :last-turn :limits :model :restart-pending`.
+- **On the model, for watches.** `:agent-watches` (buffer name → `{:buffer :file :follower :root
+  :title :config-dir :follow? :working? :caught-up? :pending}`).
 - **On a chat buffer.** `:agent-session` (its id), `:transcript-end`, `:input-start`,
   `:agent-pending` (calls awaiting details), `:agent-detailed`, `:agent-streamed`, the
   `:agent-face` text property, and the `[:tool id]` markers.
@@ -72,16 +75,16 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
   - `state/agent/mcp-*.json`: one per live session, mode 0600, removed when the session ends.
   - `state/agent/live/<name>.blsp` and `.lock`: each running editor loop's sessions, a few fields each, and the lock that says its bedit still runs (brood's `file/lock`). A loop that ends removes its file; one whose bedit died is swept by the next reader.
   - The profiles files.
-  - Claude Code's own session logs, which `resume` reads.
+  - Claude Code's own session logs, which `resume` reads and `watch` follows (only ever read).
 
 ## bedit's registries it plugs into
 
 All of these are claimed, so removing the package takes them all back:
 
-- event handlers: `:agent` `:agent-tool` `:agent-tui-ready` `:agent-accounts` `:agent-history`;
+- event handlers: `:agent` `:agent-tool` `:agent-tui-ready` `:agent-accounts` `:agent-history` `:agent-log`;
 - the `:agent-asks` post-step and timer, and the `:agent-keys` input step;
-- the `:agent-sessions` slot keeper and the `:agent` exit query;
-- the `:agent-chat` text faces and buffer type;
+- the `:agent-sessions` and `:agent-watches` slot keepers and the `:agent` exit query;
+- the `:agent-chat` text faces and the `:agent-chat` and `:agent-watch` buffer types;
 - the `:agent` mode-line segment and the `:agent-tick` timer;
 - M-x commands (`defcommand`);
 - `:bedit-agent/feedback` rows.
@@ -100,6 +103,6 @@ All of these are claimed, so removing the package takes them all back:
 
 ## Tests
 
-`nest test` runs 58 tests with no network and no `claude`. Builds go through a fake CLI
+`nest test` runs 112 tests with no network and no `claude`. Builds go through a fake CLI
 (`../agentkit/tests/fixtures/fake-claude`) and models through `ed-init`.
 `slow-tests/claude_live.blsp` runs one real haiku turn on your subscription, end to end.

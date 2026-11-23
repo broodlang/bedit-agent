@@ -1,0 +1,138 @@
+;; Watching a Claude Code session from its log (`bedit-agent/watch`). The follower is this test
+;; process where a test feeds the events itself (`wt-read`), and agentkit's real follower where
+;; the log on disk is the point.
+
+(defmodule watch-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/watch))
+
+(defn- scratch (prefix)
+  (let (dir (path/join (or (test/scratch-dir) (path/temp "bedit-agent-"))
+              (str prefix (rand/token 4))))
+    (os/cmd "mkdir" ["-p" dir])
+    dir))
+
+(def- entry
+  {:id "0d3f9a11-2222-3333"
+   :file "/nowhere/0d3f9a11.jsonl"
+   :cwd "/src/app"
+   :title "Fix the tests"
+   :config-dir "/home/me/.claude"
+   :size 0
+   :working? true})
+
+(defn- wt-model (&optional (watched entry))
+  "A model watching `watched`, this test process its follower."
+  (ed-watch (ed-init (make-buffer "")) watched (self)))
+
+(defn- wt-read (m events &optional (cols 80) (rows 24))
+  (ed-ev-agent-log m [:agent-log (self) {:events events :reset? false}] nil cols rows))
+
+(defn- wt-text (m) (buffer-text (ed-current-buf m)))
+
+(describe "a watched session's buffer"
+  (test "it says what it watches, and writes the conversation as a chat does"
+    (let (m (wt-read (wt-model)
+              [[:prompt "fix the tests"]
+                [:text "I'll run them."]
+                [:tool-use {:id "t1" :name "Bash" :input {:command "nest test"}}]
+                [:tool-result {:id "t1" :output "3 passed" :error? false}]
+                [:turn-done {:stop "end_turn"}]])
+          text (wt-text m))
+      (assert= (buffer-name (ed-current-buf m)) "*watch: app 0d3f9a11*")
+      (is (string/starts-with? text
+            "Watching Claude Code in /src/app · /home/me/.claude · Fix the tests"))
+      (is (includes? text "» fix the tests"))
+      (is (includes? text "  ⏺ Bash nest test"))
+      (is (includes? text "    ⎿ 3 passed"))
+      (is (includes? text "── done ──"))
+      (is (not (:working? (get (watches m) "*watch: app 0d3f9a11*"))))))
+
+  (test "the cursor at the end stays at the end as the session writes"
+    (let (m (wt-read (wt-model) [[:text "one"]])
+          more (wt-read m [[:text "two"]])
+          buffer (ed-current-buf more))
+      (assert= (buffer-point buffer) (buffer-length buffer))))
+
+  (test "watching the same session again selects its buffer"
+    (let (m (ed-watch (wt-model) entry (self)))
+      (assert= (count (seq/filter (:buffers m)
+                        (fn (buffer) (= (:agent-watch buffer) "*watch: app 0d3f9a11*"))))
+        1)))
+
+  (test "a read for a watch that is gone stops its follower"
+    (let (m (ed-init (make-buffer "")))
+      (wt-read m [[:text "x"]])
+      (receive ([:stop] :ok) (after 1000 (error "the follower was not stopped")))))
+
+  (test "killing the buffer stops its follower and drops the watch"
+    (let (m (wt-model)
+          killed (pool/cmd-kill-current-buffer m nil))
+      (receive ([:stop] :ok) (after 1000 (error "the follower was not stopped")))
+      (assert= (watches killed) {}))))
+
+(describe "following the agent's files"
+  (test "an edit that answered shows its file beside the watch, at the text it wrote"
+    (let (project (scratch "project-")
+          file (path/join project "notes.txt"))
+      (file/spit file "one\ntwo\nthree\n")
+      (let (watching (wt-read (wt-model (assoc entry :cwd project)) [[:text "backlog"]])
+            following (cmd-agent-watch-follow watching nil)
+            m (wt-read following
+                [[:tool-use
+                   {:id "e1"
+                    :name "Edit"
+                    :input {:file_path "notes.txt" :old_string "x" :new_string "three"}}]
+                  [:tool-result {:id "e1" :output "ok" :error? false}]])
+            layout (:layout m)
+            shown (map (editor/pane/pane-leaf-paths layout)
+                    (fn (path)
+                      (buffer-name (ed-buf-at m (:buffer (editor/pane/pane-payload-at layout path))))))
+            notes (ed-buf-at m (ed-buffer-index-by-file m file)))
+        (is (string/starts-with? (buffer-name (ed-current-buf m)) "*watch:"))
+        (is (includes? shown "notes.txt"))
+        (assert= (buffer-point notes) (index-of (buffer-text notes) "three")))))
+
+  (test "nothing moves while follow is off, or for the backlog"
+    (let (project (scratch "project-")
+          call [[:tool-use {:id "r1" :name "Read" :input {:file_path (path/join project "a.txt")}}]
+                 [:tool-result {:id "r1" :output "a" :error? false}]])
+      (file/spit (path/join project "a.txt") "a\n")
+      (let (off (wt-read (wt-read (wt-model (assoc entry :cwd project)) [[:text "x"]]) call)
+            backlog (wt-read (cmd-agent-watch-follow (wt-model (assoc entry :cwd project)) nil)
+                      call))
+        (assert= (count (editor/pane/pane-leaf-paths (:layout off))) 1)
+        (assert= (count (editor/pane/pane-leaf-paths (:layout backlog))) 1))))
+
+  (test "where a call's file is, as follow goes to it"
+    (assert= (target-of {:name "Read" :input {:file_path "/a/b.txt" :offset 40}} "/src")
+      {:path "/a/b.txt" :line 40 :find nil})
+    (assert= (target-of {:name "mcp__bedit__edit" :input {:path "b.txt" :new "y"}} "/src")
+      {:path "/src/b.txt" :line 1 :find "y"})
+    (is (nil? (target-of {:name "Bash" :input {:command "ls"}} "/src")))))
+
+(describe "M-x agent-list and M-x agent-watch find the sessions bedit did not start"
+  (test "a recent log is listed below bedit's sessions; RET on it watches it"
+    (let (claude (scratch "claude-")
+          logs (path/join claude "projects" "-src-app")
+          live (scratch "live-"))
+      (os/cmd "mkdir" ["-p" logs])
+      (file/spit (path/join logs "5a5a5a5a-1111.jsonl")
+        (str (json/encode {:type "user"
+                           :cwd "/src/app"
+                           :message {:content [{:type "text" :text "make it fast"}]}})
+          "\n"
+          (json/encode {:type "ai-title" :aiTitle "Speed up the loop"})
+          "\n"))
+      (binding (bedit-agent/presence/*live-dir* live
+                *claude-dirs* [claude])
+        (let (listed (cmd-agent-list (ed-init (make-buffer "")) nil)
+              buffer (ed-current-buf listed)
+              text (buffer-text buffer)
+              on-log (ed-set-buf listed (goto-char buffer (text/line->char (buffer-rope buffer) 2)))
+              watched (cmd-agent-list-visit on-log nil))
+          (is (includes? text "app (Claude Code) · working · \"Speed up the loop\""))
+          (assert= (buffer-name (ed-current-buf watched)) "*watch: app 5a5a5a5a*")
+          (pool/cmd-kill-current-buffer watched nil))))))

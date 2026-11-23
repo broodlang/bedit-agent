@@ -7,7 +7,8 @@
   (:use test)
   (:use model)
   (:use editor/buffer)
-  (:use bedit-agent/presence))
+  (:use bedit-agent/presence)
+  (:use bedit-agent/watch :only [cmd-agent-list cmd-agent-list-visit]))
 
 (defn- live-here ()
   (let (scratch (test/scratch-dir))
@@ -93,7 +94,7 @@ told to go: its pid."
 (describe "the sessions, as the tool and M-x agent-list tell them"
   (test "this project's sessions come first, each said to be you, in this bedit or in another"
     (let (dir (live-here))
-      (binding (*live-dir* dir)
+      (binding (*live-dir* dir bedit-agent/watch/*claude-dirs* [])
         (published-here (model-with chat (assoc terminal :root "/src/bedit" :id "a3")))
         (another-bedit dir terminal)
         (let (text (report (everywhere) (loop-name (self)) "/src/bedit" "a1")
@@ -109,7 +110,7 @@ told to go: its pid."
     (assert= (report [] nil "/src/bedit" nil) "No agent sessions are open."))
   (test "M-x agent-list shows every session; RET goes to one in this bedit, and says when it is elsewhere"
     (let (dir (live-here))
-      (binding (*live-dir* dir)
+      (binding (*live-dir* dir bedit-agent/watch/*claude-dirs* [])
         (let (m0 (pool/ed-open-buffer (ed-init (make-buffer "")) (make-buffer "" (:buffer chat)))
               m1 (publish (assoc m0 :agent-sessions {"a1" chat})))
           (written (self))

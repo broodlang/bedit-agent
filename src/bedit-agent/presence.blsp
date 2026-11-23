@@ -15,15 +15,10 @@
 (defmodule bedit-agent/presence
   "Every agent session open on this machine, across every running bedit: each loop publishes
 its own (`publish`, a post-step) to `state/agent/live/`, and `everywhere` reads them all back,
-skipping those whose bedit has gone. `report` is the text the `sessions` tool answers, and
-M-x agent-list shows the same in `*agent: sessions*`."
+skipping those whose bedit has gone. `report` is the text the `sessions` tool answers
+(M-x agent-list, which shows them, is `bedit-agent/watch`'s)."
   (:use model)
-  (:use interactive)
-  (:use editor/buffer)
-  (:use editor/keymap :only [keymap-bind])
-  (:use pool :only [ed-show-named])
-  (:use projects :only [editor-state-dir persist-read-value persist-write!])
-  (:use task :only [task])) ; the list is read off the loop
+  (:use projects :only [editor-state-dir persist-read-value persist-write!]))
 
 ;; Where the live files go; a test binds its own.
 (defdyn *live-dir* nil)
@@ -57,7 +52,8 @@ M-x agent-list shows the same in `*agent: sessions*`."
    :busy (= true (:busy session))
    :status (:status session)
    :started (:started session)
-   :turn-started (:turn-started session)})
+   :turn-started (:turn-started session)
+   :claude-session (:claude-session session)})
 
 (defn- published (m)
   ;; the summaries of `m`'s sessions, oldest first
@@ -230,74 +226,3 @@ each says whether it is you, in this bedit or in another one.
                          (cons (if (nil? root) "Agent sessions:" "In other projects:")
                            (lines elsewhere))))
           "\n"))))
-
-;; ---- M-x agent-list ----------------------------------------------------------------------------
-
-(def list-name "*agent: sessions*")
-
-(defn- list-text (bedits own)
-  ;; `[text rows]`: the sessions as lines, and the session each line is about
-  (let (rows (vec (seq/sort-by (placed bedits own nil)
-                    (fn ([session _]) [(str (:root session)) (or (:started session) 0)])))
-        header "Agent sessions on this machine — RET goes to one in this bedit, g refreshes\n\n")
-    [(str header
-       (if (empty? rows)
-         "No agent sessions are open."
-         (string/join (map rows (fn ([session where]) (session-line session where))) "\n")))
-      rows]))
-
-(defn ed-list-read (m bedits)
-  "Show `bedits` (`everywhere`'s, read off the loop) in *agent: sessions*, each line knowing its
-session for RET."
-  (let ([text rows] (list-text (or bedits []) (loop-name (self)))
-        shown (ed-show-named (dissoc m :agent-list-job) list-name text :agent-sessions))
-    (ed-set-buf shown (assoc (ed-current-buf shown) :agent-list-rows rows))))
-
-(register-task-reply :agent-list-job 'bedit-agent/presence/ed-list-read nil nil)
-
-(defn- read-list (m)
-  ;; every bedit's sessions read in a task, shown when it answers (`ed-list-read`)
-  (let (dir (live-dir))
-    (cond
-      (:agent-list-job m) m
-      (ed-headless?) (ed-list-read m (everywhere dir))
-      else (assoc m :agent-list-job (task (fn () (everywhere dir)) {:timeout 5000})))))
-
-(defcommand cmd-agent-list
-  (m key)
-  "Every agent session open on this machine, in this bedit and every other one running: its
-project and profile, whether it is working, what it is about. RET on one in this bedit goes to
-its buffer; g refreshes."
-  (read-list m))
-
-(defcommand cmd-agent-list-refresh
-  (m key)
-  "In *agent: sessions*: read every bedit's sessions again."
-  (read-list m))
-
-(defcommand cmd-agent-list-visit
-  (m key)
-  "In *agent: sessions*: go to the session on this line, when it is in this bedit."
-  (let (buffer (ed-current-buf m)
-        line (- (text/char->line (buffer-rope buffer) (buffer-point buffer)) 2)
-        row (when (>= line 0) (nth (or (:agent-list-rows buffer) []) line nil))
-        [session where] (or row [nil nil])
-        index (when (and session (not (= where "another bedit")))
-                (ed-buffer-index-by-name m (:buffer session))))
-    (cond
-      (nil? session) (message m "no session on this line")
-      (nil? index) (message m (str (:buffer session) " is in another bedit window"))
-      else (pool/ed-select m index))))
-
-(def list-keymap
-  (-> {}
-    (keymap-bind [:enter] 'bedit-agent/presence/cmd-agent-list-visit)
-    (keymap-bind ["g"] 'bedit-agent/presence/cmd-agent-list-refresh)))
-
-(def list-layer
-  {:name 'agent-sessions
-   :doc "Every agent session on this machine: RET goes to one in this bedit, g refreshes."
-   :keymap list-keymap
-   :commands (modes/layer-commands list-keymap)})
-
-(modes/register-special-type :agent-sessions 'bedit-agent/presence/list-layer)

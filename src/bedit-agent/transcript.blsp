@@ -244,7 +244,7 @@ change; with the window `size` (`[cols rows]`), one at the prompt scrolled to ke
 
 (defn- input-summary (session input)
   (cond
-    (:command input) (:command input)
+    (:command input) (first-line (:command input))
     (:path input)
       (str (relative session (:path input)) (if (:line input) (str ":" (:line input)) ""))
     (:pattern input) (:pattern input)

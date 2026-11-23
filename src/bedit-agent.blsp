@@ -20,6 +20,7 @@ remove. docs/architecture.md has what each module is for."
   (:load bedit-agent/start)
   (:load bedit-agent/commands)
   (:load bedit-agent/resume)
+  (:load bedit-agent/watch)
   (:load bedit-agent/context)
   (:load bedit-agent/menu)
   (:load bedit-agent/chip))
