@@ -42,6 +42,7 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
 | `diffs` | diff lines and unified diffs, coloured, shown beside you |
 | `transcript` | writing a chat's transcript: inserting above the prompt, events, a call's details under its row, carrying windows |
 | `edits` | `edit` / `write` through buffers (splices, saved on the loop), what changed (`show_changes`, `show_diff`) |
+| `plan` | the `plan` tool: the steps on the session (`:plan`), written as Org into its `*plan:*` buffer; the files changed under the step in progress; your edits handed back to the agent; a resumed chat's plan from its history; a watched session's outline (`outline-step`, `render-outline`) |
 | `permission` | the approvals queue: decided at once, or queued — asked in a chat's minibuffer (`ask-waiting`, the request shown above its prompt) and listed in `*agent: approvals*`, as the diff it would make; `y n a o`; the window taken away once nothing waits; declining a session's requests |
 | `feedback` | `:ran`: the call's details into the transcript; the feedback registry |
 | `bridge` | the one event handler for tool requests; the read-only requests |
@@ -64,9 +65,10 @@ The editor loop never waits on the agent. Every request a handler makes gets exa
   - `:server` (`{:pid :url :token}`), `:config-file`, `:config-dir`;
   - `:worker` (agentkit's pid) and `:claude-session`;
   - `:always` (`{:tools :commands}`), `:originals` (path → text before the first edit), `:queued`;
-  - `:title :turn-started :last-turn :limits :model :restart-pending`.
+  - `:title :turn-started :last-turn :limits :model :restart-pending`;
+  - `:plan` (the steps: `{:title :state :note :files :started :finished}`) and `:plan-text` (what bedit last wrote into the plan buffer, so your edits show).
 - **On the model, for watches.** `:agent-watches` (buffer name → `{:buffer :file :follower :root
-  :title :config-dir :follow? :working? :caught-up? :pending}`).
+  :title :config-dir :follow? :working? :caught-up? :pending :outline}`), `:outline` what `plan/outline-step` read off its log.
 - **On a chat buffer.** `:agent-session` (its id), `:transcript-end`, `:input-start`,
   `:agent-pending` (calls awaiting details), `:agent-detailed`, `:agent-streamed`, the
   `:agent-face` text property, and the `[:tool id]` markers.
@@ -103,6 +105,6 @@ All of these are claimed, so removing the package takes them all back:
 
 ## Tests
 
-`nest test` runs 112 tests with no network and no `claude`. Builds go through a fake CLI
+`nest test` runs 123 tests with no network and no `claude`. Builds go through a fake CLI
 (`../agentkit/tests/fixtures/fake-claude`) and models through `ed-init`.
 `slow-tests/claude_live.blsp` runs one real haiku turn on your subscription, end to end.

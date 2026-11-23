@@ -28,7 +28,8 @@ and `M-x agent-list`, every agent session, bedit's and the rest."
   (:use bedit-agent/presence :only [everywhere loop-name session-line live-dir])
   (:use bedit-agent/workspace :only [buffer-index-for])
   (:use bedit-agent/transcript :only [ed-chat-write write-event transcript-line face-property])
-  (:use bedit-agent/chat :only [chat-line-loc ed-goto-row]))
+  (:use bedit-agent/chat :only [chat-line-loc ed-goto-row])
+  (:use bedit-agent/plan :only [outline-step render-outline write-outline]))
 
 ;; ---- the watches on the model ------------------------------------------------------------------
 ;; `:agent-watches` is buffer name -> `{:buffer :file :follower :root :title :config-dir :follow?
@@ -66,7 +67,7 @@ and `M-x agent-list`, every agent session, bedit's and the rest."
     (if (:config-dir entry) (str " · " (path/abbreviate (:config-dir entry))) "")
     " · "
     (:title entry)
-    "\nread-only · n / p turns · RET opens a path:line · f follows the files it touches · q stops watching\n"))
+    "\nread-only · n / p turns · RET opens a path:line · f follows the files it touches · o its outline · q stops watching\n"))
 
 (defn- watch-session (watch)
   ;; what the transcript writer is told of the session it writes for
@@ -184,15 +185,56 @@ file.
         found (if (:find target) (index-of (buffer-text buffer) (:find target)) -1))
     (if (< found 0) m (ed-set-buf m (goto-char buffer found)))))
 
+(defn- flash-target (m)
+  ;; `m` with the line follow just showed (point's, in the selected buffer) flashed in every
+  ;; window showing it, so the eye finds it
+  (let (buffer (ed-current-buf m)
+        line (buffer-current-line buffer))
+    (try (decorations/pulse/flash-lines m (buffer-name buffer) line line) (catch _ m))))
+
 (defn ed-show-target (m name target)
   "`m` with `target` (`target-of`'s) shown in a window beside watch buffer `name`, which stays
 selected."
   (let (shown (ed-pop-to-file (fresh m (:path target))
                 (:path target)
                 (:line target)
-                (fn (popped) (at-text popped target)))
+                (fn (popped) (flash-target (at-text popped target))))
         index (ed-buffer-index-by-name shown name))
     (if index (select-pane-of shown index) shown)))
+
+(defn outline-name-for (name)
+  "The outline buffer of watch buffer `name`.
+
+    (bedit-agent/watch/outline-name-for \"*watch: app 0d3f9a11*\")   ;=> \"*plan: app 0d3f9a11*\""
+  (match name
+    ((str "*watch: " rest) (str "*plan: " rest))
+    (_ (str "*plan: " name "*"))))
+
+(defn- outline-text (watch)
+  (render-outline (str (path/basename (or (:root watch) "?")) " · " (:title watch))
+    (or (:outline watch) {})))
+
+(defn- refresh-outline (m name)
+  ;; `m` with watch `name`'s outline rewritten, when its buffer is open
+  (let (watch (get (watches m) name)
+        outline-name (outline-name-for name))
+    (if (and watch (ed-buffer-index-by-name m outline-name))
+      (write-outline m outline-name (:root watch) (outline-text watch) false)
+      m)))
+
+(defn ed-show-outline (m name)
+  "`m` with watch `name`'s outline — each prompt a heading, each tool call a step under it, its
+own todo list first — shown beside you and kept current as the log grows."
+  (let (watch (get (watches m) name)
+        outline-name (outline-name-for name))
+    (cond
+      (nil? watch) (message m "not a watch buffer")
+      (ed-buffer-index-by-name m outline-name)
+        (pool/ed-display-buffer (refresh-outline m name)
+          outline-name
+          (outline-text watch)
+          :org {:action :display :keep-scroll true})
+      else (write-outline m outline-name (:root watch) (outline-text watch) true))))
 
 (defn- following? (m watch)
   ;; follow moves a window only while you are in the watch buffer, after its backlog
@@ -219,7 +261,14 @@ follower whose watch is gone is stopped."
                           (fn (so-far [kind payload]) (write-event so-far kind payload session))))
                       [cols rows])
             stepped (fold events (dissoc watch :target) step)
-            stored (put-watch written (assoc (dissoc stepped :target) :caught-up? true)))
+            outlined (assoc stepped
+                       :outline
+                         (fold events
+                           (or (:outline watch) {})
+                           (fn (outline event) (outline-step outline event (:root watch)))))
+            stored (refresh-outline (put-watch written
+                                      (assoc (dissoc outlined :target) :caught-up? true))
+                     (:buffer watch)))
         (if (and (:target stepped) (following? stored watch))
           (ed-show-target stored (:buffer watch) (:target stepped))
           stored)))))
@@ -254,6 +303,24 @@ file it reads or changes is shown in the other window at the place it touched."
         (message (put-watch m (assoc watch :follow? on?))
           (if on? "following the agent's files" "no longer following its files"))))))
 
+(defcommand cmd-agent-watch-outline
+  (m key)
+  "o in a watch buffer: its outline beside you, as Org — each prompt a heading, each tool call a
+step under it, DOING until it answers, and the agent's own todo list first when it keeps one."
+  (ed-show-outline m (buffer-name (ed-current-buf m))))
+
+(defcommand cmd-agent-plan
+  (m key)
+  "Show the plan of the session you are in, else of this project's latest session, beside you:
+the Org outline the agent keeps with its `plan` tool. In a watch buffer, the watched session's
+outline."
+  (let (name (buffer-name (ed-current-buf m)))
+    (if (get (watches m) name)
+      (ed-show-outline m name)
+      (let (session (or (bedit-agent/chat/current-session m)
+                      (last (bedit-agent/start/live-sessions m (bedit-agent/start/project-root m)))))
+        (if session (bedit-agent/plan/ed-show-plan m session) (message m "agent: no session here"))))))
+
 (defcommand cmd-agent-watch-next-row
   (m key)
   "n in a watch buffer: the next turn or tool call."
@@ -279,6 +346,7 @@ end, where the window follows the tail."
     (keymap-bind ["n"] 'bedit-agent/watch/cmd-agent-watch-next-row)
     (keymap-bind ["p"] 'bedit-agent/watch/cmd-agent-watch-previous-row)
     (keymap-bind ["f"] 'bedit-agent/watch/cmd-agent-watch-follow)
+    (keymap-bind ["o"] 'bedit-agent/watch/cmd-agent-watch-outline)
     (keymap-bind ["q"] 'pool/cmd-kill-current-buffer)))
 
 (def watch-layer
@@ -288,7 +356,7 @@ end, where the window follows the tail."
    :commands (modes/layer-commands watch-keymap)
    :line-loc 'bedit-agent/chat/chat-line-loc
    :electric-pair false
-   :read-only-hint "a watched session is read-only — n / p move between turns, f follows its files, q stops"
+   :read-only-hint "a watched session is read-only — n / p move between turns, f follows its files, o its outline, q stops"
    :long-lines :wrap})
 
 (modes/register-type :agent-watch

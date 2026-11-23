@@ -39,6 +39,7 @@ wherever it runs, and RET on one watches it (below). Agents see bedit's through 
 | `show_changes` | show you a diff of what **the agent** changed this session (against each file before its first edit) | `:read` |
 | `show_diff` | show you the uncommitted changes against git's HEAD | `:read` |
 | `sessions` | the other agent sessions open on this machine, in this project and every other, in every running bedit: who, working or idle, and what about | `:read` |
+| `plan` | keep its plan in an Org outline beside you, live (below) | `:read` |
 
 Anything that reaches **outside the project** (and the profile's `:add-dirs`) asks, whatever the
 profile says. Ask "what did you change? show me" and the agent calls `show_changes`.
@@ -148,9 +149,43 @@ lines arrive. The last half megabyte of the log is shown when it opens.
   is shown in the other window at the place it touched, once the tool has answered. A file open in
   bedit and unedited is reverted first, so the change is there.
 - **n** / **p** move between turns and tool calls; **RET** on a `path:line` opens it.
+- **o** shows its outline, as Org, in `*plan: <project> <id>*`: each prompt a heading and each
+  tool call a step under it, DOING until it answers, a failed one said. A session that keeps Claude
+  Code's own todo list (`TodoWrite`) has that list first. It follows the log while it is open;
+  `M-x agent-plan` in the watch buffer shows it too.
+- Follow flashes the line it shows, so the eye finds it.
 - **q** stops watching. The session itself is not touched: watching only reads its log.
 
 Needs agentkit's `claude-log` (brood ADR-780, `file/slurp-bytes-from`).
+
+## The plan, live
+
+The agent keeps its plan with the `plan` tool, and bedit shows it beside you in
+`*plan: <project>/<profile>*`, an Org buffer that changes as the agent works:
+
+```org
+#+TITLE: bedit/dev
+
+* DONE run the tests to see what fails
+  took 1m 4s
+* DOING make ed-ensure-file-buffer public
+  it is private, and edits need it
+  - [[file:src/pool.blsp::713][src/pool.blsp:713]]
+* TODO rerun pool_test
+```
+
+- The agent sends the whole plan each time a step starts or finishes. One step is DOING while
+  it works on it, and the mode-line chip names it: `✦ dev · working 14s · make ed-ensure…`.
+- Each file the agent changes is listed under the step in progress, at the line it changed.
+  A finished step says how long it took.
+- The first plan opens the buffer beside you. After that it is refreshed wherever it is shown, your
+  point and undo history left alone. `M-x agent-plan` shows it again, and a resumed chat
+  (`M-x agent-resume`) has the plan it last kept.
+- **C-c C-o** on a file link opens the file at that line (bedit's org mode).
+- Every edit the agent makes flashes the lines it wrote, in each window showing the file.
+- **The plan is yours to edit.** Add a TODO, cancel a step, reorder them, write a note under one.
+  bedit then does not write the agent's next plan over yours: the agent is answered with your
+  version, and sends its plan again with your changes taken in.
 
 ## Handing the agent context
 

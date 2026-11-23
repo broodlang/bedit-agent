@@ -238,7 +238,7 @@ bedit through bedit's tools, then the profile's `:instructions`."
     "`write` change files through bedit's buffers and save them, `diagnostics` shows what "
     "bedit's language servers and checkers report, `show` opens a file for the user at a "
     "line, `show_changes` shows the user a diff of what you changed this session (use it when "
-    "they ask what you changed), `show_diff` their uncommitted changes against git. Some calls ask the user first; a declined call says so — do not retry it unchanged."
+    "they ask what you changed), `show_diff` their uncommitted changes against git, `plan` keeps your plan in an Org outline the user watches (use it for any task of more than a couple of steps, and keep it current as you go). Some calls ask the user first; a declined call says so — do not retry it unchanged."
     (if (:instructions profile) (str "\n\n" (:instructions profile)) "")))
 
 ;; ---- the agent's process ---------------------------------------------------------------------

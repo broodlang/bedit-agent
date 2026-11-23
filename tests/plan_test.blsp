@@ -1,0 +1,120 @@
+(defmodule plan-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use bedit-agent/sessions)
+  (:use bedit-agent/bridge)
+  (:use bedit-agent/plan))
+
+(defn pt-setup ()
+  "`[model dir file]`: a scratch file and a session rooted at its dir."
+  (let (dir (path/join (or (test/scratch-dir) "/tmp") (str "plan-" (rand/token 6)))
+        file (path/join dir "notes.txt"))
+    (file/mkdir dir)
+    (file/spit file "one\ntwo\nthree\n")
+    [(put-session (ed-init (make-buffer ""))
+       {:id "a1" :root dir :profile {:name "dev"} :buffer "*agent: x/dev*"})
+      dir file]))
+
+(defn pt-ask (m request)
+  "`[model' result]`: `request` from session a1 put to the loop's handler, and its answer."
+  (let (tag (ref)
+        next (ed-ev-agent-tool m [:agent-tool (assoc request :session "a1") (self) tag] nil 80 24))
+    [next (receive ([:agent-tool-reply ^tag result] result) (after 1000 :no-reply))]))
+
+(defn pt-text (m)
+  (let (index (ed-buffer-index-by-name m "*plan: x/dev*"))
+    (if index (buffer-text (ed-buf-at m index)) nil)))
+
+(def pt-steps
+  [{:title "run the tests" :state "done"}
+    {:title "fix the pool" :state "doing" :note "ed-ensure-file-buffer is private"}
+    {:title "rerun them" :state "todo"}])
+
+(describe "the plan tool"
+  (test "the plan is written as Org into the session's plan buffer, shown beside you"
+    (let ([m _dir _file] (pt-setup)
+          [next result] (pt-ask m {:op :plan :steps pt-steps}))
+      (is (:ok? result))
+      (assert= (:summary result) "1/3 done · fix the pool")
+      (assert= (pt-text next)
+        "#+TITLE: x/dev\n\n* DONE run the tests\n* DOING fix the pool\n  ed-ensure-file-buffer is private\n* TODO rerun them\n")
+      (let (index (ed-buffer-index-by-name next "*plan: x/dev*"))
+        (assert= (:type (ed-buf-at next index)) :org))))
+  (test "a file the agent edits is listed under the step in progress"
+    (let ([m _dir file] (pt-setup)
+          [planned _] (pt-ask m {:op :plan :steps pt-steps})
+          [edited _] (pt-ask planned {:op :edit :path file :old "two" :new "TWO"}))
+      (assert= (pt-text edited)
+        "#+TITLE: x/dev\n\n* DONE run the tests\n* DOING fix the pool\n  ed-ensure-file-buffer is private\n  - [[file:notes.txt::2][notes.txt:2]]\n* TODO rerun them\n")
+      ;; the next plan keeps it, and the finished step says how long it took
+      (let ([again _] (pt-ask edited
+                        {:op :plan
+                         :steps [{:title "fix the pool" :state "done"}
+                                  {:title "rerun them" :state "doing"}]}))
+        (is (includes? (pt-text again) "* DONE fix the pool\n  took 0s\n  - [[file:notes.txt::2]"))
+        (assert= (doing (session-of again "a1")) "rerun them"))))
+  (test "an edit made while no step is in progress lists nothing"
+    (let ([m _dir file] (pt-setup)
+          [planned _] (pt-ask m {:op :plan :steps [{:title "a" :state "todo"}]})
+          [edited _] (pt-ask planned {:op :edit :path file :old "two" :new "TWO"}))
+      (assert= (pt-text edited) "#+TITLE: x/dev\n\n* TODO a\n")))
+  (test "your edit of the buffer is handed back to the agent instead of being written over"
+    (let ([m _dir _file] (pt-setup)
+          [planned _] (pt-ask m {:op :plan :steps pt-steps})
+          index (ed-buffer-index-by-name planned "*plan: x/dev*")
+          buffer (ed-buf-at planned index)
+          mine (ed-set-buf-at planned
+                 index
+                 (insert (goto-char buffer (buffer-length buffer)) "* TODO write the docs\n"))
+          [answered result] (pt-ask mine
+                              {:op :plan :steps [{:title "run the tests" :state "done"}]}))
+      (assert= (:summary result) "the user edited the plan")
+      (is (includes? (:output result) "* TODO write the docs"))
+      ;; nothing was written over your text, and the next plan, with your step taken in, is
+      (is (includes? (pt-text answered) "* TODO write the docs"))
+      (let ([after _] (pt-ask answered
+                        {:op :plan
+                         :steps [{:title "run the tests" :state "done"}
+                                  {:title "write the docs" :state "doing"}]}))
+        (assert= (pt-text after) "#+TITLE: x/dev\n\n* DONE run the tests\n* DOING write the docs\n"))))
+  (test "an edit flashes the lines it wrote in the windows showing the file"
+    (let ([m _dir file] (pt-setup)
+          [edited result] (pt-ask m {:op :edit :path file :old "two" :new "TWO\nand more"}))
+      (is (:ok? result))
+      (assert= (vec (map (:flashes edited) (fn (flash) [(:name flash) (:from flash) (:to flash)])))
+        [["notes.txt" 1 2]])))
+  (test "a resumed chat has the plan its history last kept, unshown until asked for"
+    (let ([m _dir _file] (pt-setup)
+          resumed (bedit-agent/resume/ed-ev-agent-history m
+                    [:agent-history
+                      "a1"
+                      [[:prompt "go"]
+                        [:tool-use
+                          {:id "t1"
+                           :name "mcp__bedit__plan"
+                           :input {:steps [{:title "old" :state "doing"}]}}]
+                        [:tool-use
+                          {:id "t2"
+                           :name "mcp__bedit__plan"
+                           :input {:steps [{:title "old" :state "done"}
+                                            {:title "new" :state "doing"}]}}]]]
+                    nil
+                    80
+                    24))
+      (assert= (pt-text resumed) "#+TITLE: x/dev\n\n* DONE old\n* DOING new\n")
+      (assert= (doing (session-of resumed "a1")) "new")))
+  (test "an unknown state is a todo"
+    (assert= (vec (map (merged [] [{:title "a" :state "maybe"}] 0) :state)) ["todo"]))
+  (test "M-x agent-plan shows the plan, or says there is none yet"
+    (let ([m _dir _file] (pt-setup)
+          session (session-of m "a1"))
+      (is (includes? (:echo (ed-show-plan m session)) "not written a plan yet"))
+      (let ([planned _] (pt-ask m {:op :plan :steps pt-steps})
+            shown (ed-show-plan planned (session-of planned "a1")))
+        (assert= (buffer-name (ed-current-buf shown)) "*plan: x/dev*"))))
+  (test "the chip names the step in progress while the agent works"
+    (let ([m _dir _file] (pt-setup)
+          [planned _] (pt-ask m {:op :plan :steps pt-steps})
+          session (assoc (session-of planned "a1") :busy true :turn-started (os/now)))
+      (assert= (bedit-agent/chip/chip-text planned session) "✦ dev · working 0s · fix the pool"))))

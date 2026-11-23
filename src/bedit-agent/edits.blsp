@@ -126,6 +126,20 @@
     [(show-diff m (:title request) (:text request))
       (succeeded (str "shown to the user:\n" (bedit-agent/tools/clip (:text request))) "shown")]))
 
+;; The most lines of a change flashed in the windows showing it: a rewritten file flashes its head.
+(def- flash-limit 200)
+
+(defn- flashed (m index line lines)
+  ;; `m` with the lines a change wrote (`line` 1-based, `lines` long) flashed in every window
+  ;; showing buffer `index` (bedit's `decorations/pulse/flash-lines`), so you see where the agent
+  ;; wrote; a bedit without flashes shows nothing
+  (try
+    (decorations/pulse/flash-lines m
+      (buffer-name (ed-buf-at m index))
+      (dec line)
+      (+ (dec line) (dec (math/min flash-limit (math/max 1 (or lines 1))))))
+    (catch _ m)))
+
 (defn- change-file (m session path plan)
   "`[m' result]`: `plan` — `(text) -> {:splices :summary-line :details}` or a failed result —
 made to the buffer of file `path` (opened, unselected, when bedit has none) and saved. The
@@ -158,9 +172,10 @@ read again first."
                 where (str (relative session path) ":" (:line planned)))
             (if problem
               [saved (failed (str "edited in bedit but not saved: " problem))]
-              [saved
+              [(flashed saved index (:line planned) (:lines planned))
                 (assoc (succeeded (str (:verb planned) " " where (:note planned "")))
-                  :details (:details planned))])))))))
+                  :details (:details planned)
+                  :touched where)])))))))
 
 (defn- edit-plan (request)
   (fn (text)
@@ -179,6 +194,7 @@ read again first."
         else
           {:splices (vec (map found (fn (at) [at (+ at (count old)) new])))
            :line (line-of text (first found))
+           :lines (count (string/split new "\n"))
            :verb "edited"
            :note (str " (" (count found) (if (= (count found) 1) " replacement)" " replacements)"))
            :details (diff-lines old new)}))))
@@ -188,6 +204,7 @@ read again first."
     (let (content (or (:content request) ""))
       {:splices [[0 (count text) content]]
        :line 1
+       :lines (count (string/split content "\n"))
        :verb (if (= text "") "wrote" "rewrote")
        :note (str " (" (count (string/split content "\n")) " lines)")
        :details (if (= text "")

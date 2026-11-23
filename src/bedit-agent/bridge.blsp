@@ -8,6 +8,7 @@
 ;;   :read :buffers :diagnostics :show  here         (what bedit holds; a file shown to you)
 ;;   :edit :write :changes :show-diff edits         (through bedit's buffers; what changed)
 ;;   :ran                             feedback      (written into the transcript; the feedback)
+;;   :plan                            plan          (the plan written into its Org buffer)
 
 (defmodule bedit-agent/bridge
   "The loop's answer to every tool request (`ed-ev-agent-tool`), and the requests that only
@@ -20,7 +21,8 @@ read what bedit holds."
   (:use bedit-agent/workspace :only [reply buffer-index-for diagnostics-of diagnostics-state])
   (:use bedit-agent/edits :only [edit-answer write-answer changes-answer display-diff-answer])
   (:use bedit-agent/permission :only [permission-request])
-  (:use bedit-agent/feedback :only [ran-answer]))
+  (:use bedit-agent/feedback :only [ran-answer])
+  (:use bedit-agent/plan :only [plan-answer note-touched]))
 
 ;; ---- what bedit holds ------------------------------------------------------------------------
 
@@ -60,6 +62,14 @@ read what bedit holds."
   [(ed-pop-to-file m (:path request) (or (:line request) 1))
     (succeeded (str "showing " (:path request)) "shown")])
 
+(defn- touched (answer id)
+  ;; an edit's answer, with the place it changed listed under the plan's step in progress; a
+  ;; plan that cannot be written never turns a made edit into a failed one
+  (let ([m result] answer)
+    (if (:touched result)
+      [(try (note-touched m id (:touched result)) (catch _ m)) result]
+      answer)))
+
 ;; ---- the event ---------------------------------------------------------------------------------
 
 (defn- answer-request (m input request size)
@@ -75,8 +85,9 @@ read what bedit holds."
       :show (show-answer m request)
       :changes (changes-answer m request)
       :show-diff (display-diff-answer m request)
-      :edit (edit-answer m session request)
-      :write (write-answer m session request)
+      :edit (touched (edit-answer m session request) (:session request))
+      :write (touched (write-answer m session request) (:session request))
+      :plan (plan-answer m session request)
       [m (failed (str "unknown request " (:op request)))])))
 
 (defn ed-ev-agent-tool (m input _textrows cols rows)

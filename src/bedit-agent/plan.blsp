@@ -1,0 +1,366 @@
+;; The agent's PLAN, live, as an Org outline. The agent keeps its plan with the `plan` tool, the
+;; whole list each time (each step a title and a state, todo / doing / done / cancelled), and
+;; bedit writes it into the session's `*plan: <project>/<profile>*` buffer in org-mode:
+;;
+;;   * DONE run the tests to see what fails
+;;     took 1m 4s
+;;   * DOING make ed-ensure-file-buffer public
+;;     - [[file:src/pool.blsp::713][src/pool.blsp:713]]
+;;   * TODO rerun pool_test
+;;
+;; Each step lists the files the agent changed while it was the one in progress, and how long it
+;; took. The first plan opens the buffer beside you; after that it is refreshed wherever it is
+;; shown, and `M-x agent-plan` shows it again.
+;;
+;; The plan goes BOTH WAYS: the buffer is yours to edit — add a TODO, cancel a step, write a note
+;; under one. The agent's next `plan` call is then not written; it is answered with your version,
+;; and the agent sends its plan again with your changes taken in.
+
+(defmodule bedit-agent/plan
+  "A session's plan (the `plan` tool): the steps on the session record, written as Org into its
+*plan:* buffer, the files changed under the step in progress, and your edits to the buffer handed
+back to the agent."
+  (:use editor/buffer)
+  (:use model)
+  (:use agentkit/tool)
+  (:use pool :only [ed-display-buffer])
+  (:use bedit-agent/sessions :only [session-of update-session]))
+
+;; The states a step may be in, as the agent names them and as Org writes them.
+(def states {"todo" "TODO" "doing" "DOING" "done" "DONE" "cancelled" "CANCELLED"})
+
+(defn buffer-name-for (session)
+  "The plan buffer of `session`, named after its chat buffer.
+
+    (bedit-agent/plan/buffer-name-for {:buffer \"*agent: bedit/dev*\"})   ;=> \"*plan: bedit/dev*\""
+  (match (:buffer session)
+    ((str "*agent: " rest) (str "*plan: " rest))
+    (name (str "*plan: " name "*"))))
+
+(defn- duration (ms)
+  ;; `1m 4s`, `12s`, `1h 3m`
+  (let (seconds (math/round (/ ms 1000))
+        minutes (math/quot seconds 60)
+        hours (math/quot minutes 60))
+    (cond
+      (> hours 0) (str hours "h " (math/rem minutes 60) "m")
+      (> minutes 0) (str minutes "m " (math/rem seconds 60) "s")
+      else (str seconds "s"))))
+
+(defn- org-link (touched)
+  ;; `src/a.txt:12` as an Org file link to that line
+  (let (found (regex/find touched "^(.*):([0-9]+)$"))
+    (if found
+      (let (path (:text (first (:groups found)))
+            line (:text (second (:groups found))))
+        (str "[[file:" path "::" line "][" touched "]]"))
+      (str "[[file:" touched "]]"))))
+
+(defn render (session)
+  "The Org text of `session`'s plan: a title line, then a heading per step
+with what was changed under it and how long it took.
+
+    (bedit-agent/plan/render {:buffer \"*agent: x/dev*\" :plan [{:title \"Run it\" :state \"doing\" :started 0 :files [\"a.txt:3\"]}]})   ;=> \"#+TITLE: x/dev\\n\\n* DOING Run it\\n  - [[file:a.txt::3][a.txt:3]]\\n\""
+  (let (name (match (buffer-name-for session)
+               ((str "*plan: " rest "*") rest)
+               (other other))
+        steps (map (or (:plan session) [])
+                (fn (step)
+                  (let (state (:state step)
+                        took (cond
+                               (and (int? (:started step)) (int? (:finished step)))
+                                 (str "  took "
+                                   (duration (- (:finished step) (:started step)))
+                                   "\n")
+                               else ""))
+                    (str "* "
+                      (get states state "TODO")
+                      " "
+                      (:title step)
+                      "\n"
+                      took
+                      (if (string/blank? (or (:note step) ""))
+                        ""
+                        (str (string/join (map (string/split (string/trim (:note step)) "\n")
+                                            (fn (line) (str "  " line)))
+                               "\n")
+                          "\n"))
+                      (string/join (map (or (:files step) [])
+                                     (fn (touched) (str "  - " (org-link touched) "\n")))
+                        ""))))))
+    (str "#+TITLE: " name "\n\n" (string/join steps ""))))
+
+(defn merged (old steps now)
+  "The plan `steps` (the agent's, `{:title :state :note}`) over the plan `old` it replaces: a step
+whose title was there before keeps its files and times; one that became doing starts its clock
+`now`, one that became done or cancelled stops it.
+
+    (map (bedit-agent/plan/merged [{:title \"a\" :state \"doing\" :started 1 :files [\"x:1\"]}] [{:title \"a\" :state \"done\"}] 9) :finished)   ;=> (9)"
+  (let (before (into {} (map old (fn (step) [(:title step) step]))))
+    (vec (map steps
+           (fn (step)
+             (let (earlier (get before (:title step) {})
+                   state (if (contains? states (:state step)) (:state step) "todo")
+                   started (cond
+                             (int? (:started earlier)) (:started earlier)
+                             (= state "doing") now
+                             else nil)
+                   finished (cond
+                              (int? (:finished earlier)) (:finished earlier)
+                              (and started (includes? ["done" "cancelled"] state)) now
+                              else nil))
+               {:title (:title step)
+                :state state
+                :note (:note step)
+                :files (or (:files earlier) [])
+                :started started
+                :finished (if (= state "doing") nil finished)}))))))
+
+(defn- held-text (m session)
+  ;; the plan buffer's text as it is now, or nil when it is not open
+  (let (index (ed-buffer-index-by-name m (buffer-name-for session)))
+    (if index (buffer-text (ed-buf-at m index)) nil)))
+
+(defn user-edited? (m session)
+  "Whether you changed `session`'s plan buffer since bedit last wrote it."
+  (let (held (held-text m session))
+    (and (string? held) (string? (:plan-text session)) (not (= held (:plan-text session))))))
+
+(defn write-outline (m name root text &optional (open? true))
+  "`m` with the Org buffer `name` holding `text`, its links read under `root`: opened beside you
+the first time (only made, unshown, when `open?` is false), refreshed in place after, point kept
+where it was and nothing put in your undo history."
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index)
+      (let (shown (ed-display-buffer m name text :org {:action (if open? :display :none)})
+            at (ed-buffer-index-by-name! shown name))
+        (ed-set-buf-at shown at (assoc (ed-buf-at shown at) :dir root)))
+      (let (buffer (ed-buf-at m index)
+            point (buffer-point buffer)
+            replaced (replace-program-output buffer 0 (buffer-length buffer) text))
+        (ed-set-buf-at m index (goto-char replaced (math/min point (count text))))))))
+
+(defn- written (m id &optional (open? true))
+  ;; `m` with session `id`'s plan rendered into its buffer and remembered as written; the buffer
+  ;; made unshown when `open?` is false
+  (let (session (session-of m id))
+    (if (or (nil? session) (empty? (or (:plan session) [])))
+      m
+      (let (text (render session))
+        (update-session (write-outline m (buffer-name-for session) (:root session) text open?)
+          id
+          (fn (it) (assoc it :plan-text text)))))))
+
+(defn plan-answer (m session request)
+  "`[m' result]` for a `plan` call: the steps written into the session's plan buffer — unless you
+edited the buffer since bedit wrote it, when your version is the answer and nothing is written."
+  (cond
+    (nil? session) [m (failed "no session")]
+    (user-edited? m session)
+      (let (held (held-text m session))
+        [(update-session m (:id session) (fn (it) (assoc it :plan-text held)))
+          (succeeded (str "The user edited your plan. Their version is below; take their changes in "
+                       "(added, removed or reordered steps, changed states, notes) and call plan again "
+                       "with the result.\n\n" held)
+            "the user edited the plan")])
+    else
+      (let (steps (merged (or (:plan session) []) (or (:steps request) []) (os/now))
+            next (written (update-session m (:id session) (fn (it) (assoc it :plan steps)))
+                   (:id session))
+            doing (seq/find steps (fn (step) (= (:state step) "doing"))))
+        [next
+          (succeeded "plan shown to the user"
+            (str (count (seq/filter steps (fn (step) (= (:state step) "done"))))
+              "/"
+              (count steps)
+              " done"
+              (if doing (str " · " (:title doing)) "")))])))
+
+(defn last-planned (events)
+  "The steps of the last `plan` call among a session's `agentkit/events` (a resumed chat's
+history), or nil when it made none.
+
+    (bedit-agent/plan/last-planned [[:tool-use {:name \"mcp__bedit__plan\" :input {:steps [{:title \"a\" :state \"done\"}]}}]])   ;=> [{:title \"a\" :state \"done\"}]"
+  (let (call (seq/find (reverse (vec events))
+               (fn (event)
+                 (and (= (first event) :tool-use)
+                   (= (last (string/split (str (:name (second event))) "__")) "plan")))))
+    (when call (vec (or (:steps (:input (second call))) [])))))
+
+(defn ed-restore-plan (m id events)
+  "`m` with session `id`'s plan as its history (`events`) last left it — a resumed chat's — in its
+plan buffer, unshown (`M-x agent-plan` shows it); unchanged when the history has no plan."
+  (let (steps (last-planned events))
+    (if (or (nil? steps) (nil? (session-of m id)))
+      m
+      (written (update-session m id (fn (session) (assoc session :plan (merged [] steps (os/now)))))
+        id false))))
+
+(defn note-touched (m id touched)
+  "`m` with `touched` (`path:line`, as the transcript writes it) listed under session `id`'s step in
+progress, and its plan buffer rewritten; unchanged when no step is in progress, or you are
+editing the buffer."
+  (let (session (session-of m id)
+        steps (or (:plan session) []))
+    (if (or (nil? session)
+          (not (any? steps (fn (step) (= (:state step) "doing"))))
+          (user-edited? m session))
+      m
+      (written (update-session m
+                 id
+                 (fn (it)
+                   (assoc it
+                     :plan
+                       (vec (map steps
+                              (fn (step)
+                                (if (and (= (:state step) "doing")
+                                      (not (includes? (:files step) touched)))
+                                  (assoc step :files (conj (:files step) touched))
+                                  step)))))))
+        id))))
+
+(defn doing (session)
+  "The title of `session`'s step in progress, or nil.
+
+    (bedit-agent/plan/doing {:plan [{:title \"a\" :state \"done\"} {:title \"b\" :state \"doing\"}]})   ;=> \"b\""
+  (:title (seq/find (or (:plan session) []) (fn (step) (= (:state step) "doing")))))
+
+(defn ed-show-plan (m session)
+  "`m` with `session`'s plan buffer shown beside you and selected, your edits in it kept; said
+when the agent has written no plan yet."
+  (let (name (buffer-name-for session)
+        held (held-text m session))
+    (if (string? held)
+      (ed-display-buffer m name held :org {:action :pop :keep-scroll true})
+      (message m "agent: the agent has not written a plan yet"))))
+
+;; ---- the outline of a session bedit did not start ------------------------------------------
+;; A watched session (`bedit-agent/watch`) has no `plan` tool: its outline is read off its log
+;; instead. Each prompt is a heading and each tool call a step under it, DOING until it has
+;; answered; a session that keeps Claude Code's own todo list (`TodoWrite`) has that list first.
+;; `:turns` is `[{:prompt :done? :calls [{:id :title :state :failed?}]}]`, `:todos` the latest
+;; todo list as `[{:title :state}]`.
+
+;; How many turns an outline keeps, and how many calls under each: a day-long session stays short.
+(def outline-turns 30)
+(def outline-calls 40)
+
+(defn- one-line (text limit)
+  (let (line (string/trim (first (string/split (str text) "\n"))))
+    (if (> (count line) limit) (str (string/substring line 0 (dec limit)) "…") line)))
+
+(defn call-title (name input root)
+  "The step a tool call is in an outline: what it did, a file it touched as an Org link under
+`root`.
+
+    (bedit-agent/plan/call-title \"Bash\" {:command \"nest test\\nmore\"} \"/src\")   ;=> \"bash: nest test\"
+    (bedit-agent/plan/call-title \"Edit\" {:file_path \"/src/a.txt\"} \"/src\")   ;=> \"edit [[file:a.txt][a.txt]]\""
+  (let (tool (string/lower (last (string/split (str name) "__")))
+        path (or (:file_path input) (:notebook_path input) (:path input)))
+    (cond
+      (string? path)
+        (let (shown (match path
+                      ((str ^(str root "/") relative) relative)
+                      (_ path)))
+          (str tool " [[file:" shown "][" shown "]]"))
+      (string? (:command input)) (str tool ": " (one-line (:command input) 70))
+      (string? (:description input)) (str tool ": " (one-line (:description input) 70))
+      (string? (:pattern input)) (str tool ": " (one-line (:pattern input) 70))
+      else tool)))
+
+(defn- with-last-turn (outline f)
+  ;; `outline` with its last turn changed by `f`, a turn started first when it has none
+  (let (turns (or (:turns outline) [])
+        turns (if (empty? turns) [{:prompt "(before the log shown)" :done? false :calls []}] turns))
+    (assoc outline :turns (conj (vec (seq/drop-last turns 1)) (f (last turns))))))
+
+(defn- todo-state (status)
+  (case status "in_progress" "doing" "completed" "done" "todo"))
+
+(defn outline-step (outline event root)
+  "`outline` after one `agentkit/events` event of a watched session in `root`.
+
+    (count (:turns (bedit-agent/plan/outline-step {} [:prompt \"fix it\"] \"/src\")))   ;=> 1"
+  (let ([kind payload] event)
+    (case kind
+      :prompt
+        (let (turns (vec (map (or (:turns outline) []) (fn (turn) (assoc turn :done? true))))
+              added (conj turns {:prompt (one-line payload 80) :done? false :calls []}))
+          (assoc outline :turns (vec (seq/take-last added outline-turns))))
+      :tool-use
+        (if (= (:name payload) "TodoWrite")
+          (assoc outline
+            :todos
+              (vec (map (or (:todos (:input payload)) [])
+                     (fn (todo)
+                       {:title (one-line (or (:content todo) "") 80)
+                        :state (todo-state (:status todo))}))))
+          (with-last-turn outline
+            (fn (turn)
+              (assoc turn
+                :calls
+                  (vec (seq/take-last (conj (:calls turn)
+                                        {:id (:id payload)
+                                         :title (call-title (:name payload)
+                                                  (or (:input payload) {})
+                                                  root)
+                                         :state "doing"
+                                         :failed? false})
+                         outline-calls))))))
+      :tool-result
+        (assoc outline
+          :turns
+            (vec (map (or (:turns outline) [])
+                   (fn (turn)
+                     (assoc turn
+                       :calls
+                         (vec (map (:calls turn)
+                                (fn (call)
+                                  (if (= (:id call) (:id payload))
+                                    (assoc call :state "done" :failed? (= true (:error? payload)))
+                                    call)))))))))
+      :turn-done
+        (if (empty? (or (:turns outline) []))
+          outline
+          (with-last-turn outline
+            (fn (turn)
+              (assoc turn
+                :done? true
+                :calls
+                  (vec (map (:calls turn)
+                         (fn (call) (if (= (:state call) "doing") (assoc call :state "done") call))))))))
+      outline)))
+
+(defn render-outline (title outline)
+  "The Org text of a watched session's `outline` (`outline-step`'s), under `title`.
+
+    (bedit-agent/plan/render-outline \"app\" {:turns [{:prompt \"fix it\" :done? false :calls [{:title \"bash: ls\" :state \"doing\"}]}]})   ;=> \"#+TITLE: app\\n\\n* DOING fix it\\n** DOING bash: ls\\n\""
+  (let (todos (or (:todos outline) [])
+        plan (if (empty? todos)
+               ""
+               (str "* The agent's plan\n"
+                 (string/join (map todos
+                                (fn (todo)
+                                  (str "** "
+                                    (get states (:state todo) "TODO")
+                                    " "
+                                    (:title todo)
+                                    "\n")))
+                   "")))
+        turns (map (or (:turns outline) [])
+                (fn (turn)
+                  (str "* "
+                    (if (:done? turn) "DONE" "DOING")
+                    " "
+                    (:prompt turn)
+                    "\n"
+                    (string/join (map (:calls turn)
+                                   (fn (call)
+                                     (str "** "
+                                       (get states (:state call) "TODO")
+                                       " "
+                                       (:title call)
+                                       (if (:failed? call) " — failed" "")
+                                       "\n")))
+                      "")))))
+    (str "#+TITLE: " title "\n\n" plan (string/join turns ""))))

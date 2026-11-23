@@ -13,6 +13,7 @@ remove. docs/architecture.md has what each module is for."
   (:load bedit-agent/diffs)
   (:load bedit-agent/transcript)
   (:load bedit-agent/edits)
+  (:load bedit-agent/plan)
   (:load bedit-agent/permission)
   (:load bedit-agent/feedback)
   (:load bedit-agent/bridge)

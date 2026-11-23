@@ -15,7 +15,8 @@ going on."
   (:use bedit-agent/sessions)
   (:use bedit-agent/transcript :only [ed-chat-write write-event transcript-line])
   (:use bedit-agent/project-state :only [past-sessions])
-  (:use bedit-agent/start :only [project-root profiles-here start-session]))
+  (:use bedit-agent/start :only [project-root profiles-here start-session])
+  (:use bedit-agent/plan :only [ed-restore-plan]))
 
 (defn age (at:int now:int)
   "How long ago epoch-ms `at` was, from `now`, as a person says it.
@@ -54,7 +55,8 @@ going on."
 
 (defn ed-ev-agent-history (m input _textrows cols rows)
   "A resumed session's history read (`[:agent-history id events]`): written into its transcript
-as the live session wrote it, then a line saying the conversation goes on below."
+as the live session wrote it, then a line saying the conversation goes on below; the plan it last
+kept is in its plan buffer again."
   (let ([_ id events] input
         session (session-of m id))
     (cond
@@ -66,7 +68,7 @@ as the live session wrote it, then a line saying the conversation goes on below.
             (transcript-line buffer
               (str "(its transcript could not be read: " (error-message events) ")"))))
       else
-        (ed-chat-write m
+        (ed-chat-write (ed-restore-plan m id events)
           (:buffer session)
           (fn (buffer)
             (transcript-line (fold events

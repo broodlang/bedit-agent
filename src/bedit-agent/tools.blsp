@@ -282,6 +282,20 @@ request it makes of the loop names the session. Each tool that takes a path has 
                   (ask-editor {:op :show
                                :path (absolute root (:path args))
                                :line (if (int? (:line args)) (:line args) nil)}))}
+      {:name "plan"
+       :risk :read
+       :description "Keep your plan where the user can watch it: bedit shows it as an Org outline beside them, live, with the files you change listed under the step in progress. Send the WHOLE plan each time: when you start a task of more than a couple of steps, and whenever a step starts, finishes or the plan changes. Exactly one step is `doing` while you work on it. The user may edit the outline; if they did, the answer is their version, and you call plan again with their changes taken in."
+       :schema (object {:steps {:type "array"
+                                :items (object {:title {:type "string"
+                                                        :description "The step, short and imperative"}
+                                                :state {:type "string"
+                                                        :enum ["todo" "doing" "done" "cancelled"]}
+                                                :note {:type "string"
+                                                       :description "Optional: a line or two under the step (why, what was found)"}}
+                                         ["title" "state"])}}
+                 ["steps"])
+       :handler (fn (args)
+                  (ask-editor {:op :plan :steps (vec (or (:steps args) []))}))}
       {:name "sessions"
        :risk :read
        :description "The other agent sessions open on this machine — in this project and every other, in every running bedit: each one's project and profile, whether it is working now, and what it is about (its first message). Look before a large change, so you do not edit what another agent is editing."

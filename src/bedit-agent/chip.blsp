@@ -17,6 +17,7 @@ time current."
   (:use model)
   (:use bedit-agent/sessions)
   (:use bedit-agent/chat :only [current-session])
+  (:use bedit-agent/plan :only [doing])
   (:use theme :only [*yellow* *teal* *red*])) ; the chip's colours (brood ADR-722)
 
 (defn- seconds (session)
@@ -62,6 +63,10 @@ recent live one in this buffer's project — as its buffer shows it, or nil."
           (math/round (* 100 (:used state)))
           "%")))))
 
+(defn- clipped-step (title)
+  ;; the step in progress, cut to fit the mode line
+  (if (> (count title) 32) (str (string/substring title 0 31) "…") title))
+
 (defn chip-text (m session)
   "The chip's text for `session`.
 
@@ -75,7 +80,11 @@ recent live one in this buffer's project — as its buffer shows it, or nil."
       (map/get-in session [:profile :name])
       (cond
         (not (empty? waiting-asks)) (str " · allow? " (count waiting-asks) " waiting")
-        (:busy session) (str " · working " (seconds session) "s")
+        (:busy session)
+          (str " · working "
+            (seconds session)
+            "s"
+            (let (step (doing session)) (if step (str " · " (clipped-step step)) "")))
         (= (:status session) :starting) " · starting"
         (= (:status session) :refused) " · not started"
         (= (:status session) :ended) " · ended"

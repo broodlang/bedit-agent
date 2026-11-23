@@ -136,3 +136,34 @@
           (is (includes? text "app (Claude Code) · working · \"Speed up the loop\""))
           (assert= (buffer-name (ed-current-buf watched)) "*watch: app 5a5a5a5a*")
           (pool/cmd-kill-current-buffer watched nil))))))
+
+(describe "a watched session's outline"
+  (test "o shows each prompt as a heading and each call under it, DOING until it answers"
+    (let (m (wt-read (wt-model)
+              [[:prompt "fix the tests"]
+                [:tool-use {:id "t1" :name "Bash" :input {:command "nest test"}}]
+                [:tool-result {:id "t1" :output "3 failed" :error? true}]
+                [:tool-use {:id "t2" :name "Edit" :input {:file_path "/src/app/a.txt"}}]])
+          shown (ed-show-outline m "*watch: app 0d3f9a11*")
+          index (ed-buffer-index-by-name shown "*plan: app 0d3f9a11*"))
+      (assert= (buffer-text (ed-buf-at shown index))
+        "#+TITLE: app · Fix the tests\n\n* DOING fix the tests\n** DONE bash: nest test — failed\n** DOING edit [[file:a.txt][a.txt]]\n")
+      ;; and it follows the log while it is open
+      (let (more (wt-read shown
+                   [[:tool-result {:id "t2" :output "ok" :error? false}]
+                     [:turn-done {:stop "end_turn"}]]))
+        (is (string/ends-with? (buffer-text (ed-buf-at more index))
+              "* DONE fix the tests\n** DONE bash: nest test — failed\n** DONE edit [[file:a.txt][a.txt]]\n")))))
+  (test "a session that keeps Claude Code's own todo list has it first"
+    (let (m (wt-read (wt-model)
+              [[:prompt "ship it"]
+                [:tool-use
+                  {:id "t1"
+                   :name "TodoWrite"
+                   :input {:todos [{:content "build" :status "completed"}
+                                    {:content "test" :status "in_progress"}
+                                    {:content "push" :status "pending"}]}}]])
+          shown (ed-show-outline m "*watch: app 0d3f9a11*")
+          index (ed-buffer-index-by-name shown "*plan: app 0d3f9a11*"))
+      (is (string/starts-with? (buffer-text (ed-buf-at shown index))
+            "#+TITLE: app · Fix the tests\n\n* The agent's plan\n** DONE build\n** DOING test\n** TODO push\n* DOING ship it\n")))))
