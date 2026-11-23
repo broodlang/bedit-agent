@@ -199,7 +199,10 @@ moved its own has none)."
                                                      (fn (s) (assoc s :busy true)))
                  buffer)
         "its agent is working")
-      (let (asked (pool/cmd-kill-buffer (update-session m "a1" (fn (s) (assoc s :busy true))) nil))
+      (let (asked (pool/cmd-kill-current-buffer (update-session m
+                                                  "a1"
+                                                  (fn (s) (assoc s :busy true)))
+                    nil))
         (is (includes? (:prompt (:read-char asked)) "its agent is working — kill it anyway?"))))))
 
 (describe "a request nobody answers"
