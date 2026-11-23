@@ -156,7 +156,7 @@ lines arrive. The last half megabyte of the log is shown when it opens.
 - Follow flashes the line it shows, so the eye finds it.
 - **q** stops watching. The session itself is not touched: watching only reads its log.
 
-Needs agentkit's `claude-log` (brood ADR-780, `file/slurp-bytes-from`).
+Needs agentkit 0.2 (`claude-log`), which reads the log as the OS reports it changed (brood 0.58: `file/slurp-bytes-from`, `file/watch`).
 
 ## The plan, live
 

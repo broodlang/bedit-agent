@@ -2,7 +2,7 @@
 ;; runs — a terminal, another editor, another account (`agentkit/claude-log`) — so bedit can show
 ;; any of them as it works, read-only: `M-x agent-watch` picks one, and its *watch:* buffer is
 ;; written by the same transcript writer as a chat (`bedit-agent/transcript`) from a follower
-;; process that reads only what the log gained (brood's `file/slurp-bytes-from`). The window
+;; process that reads only what the log gained, as the OS reports it (brood's `file/slurp-bytes-from`, `file/watch`). The window
 ;; follows the tail as a compile buffer does.
 ;;
 ;; FOLLOW (`f`): while you are in the watch buffer, each file the agent reads or changes is
