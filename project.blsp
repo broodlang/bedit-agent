@@ -8,12 +8,12 @@
 ;; are the agent-neutral part.
 (project
   :name "bedit-agent"
-  :version "0.4.2"
-  :brood ">= 0.57.0"
+  :version "0.5.0"
+  :brood ">= 0.58.0"
   :description
     "Coding agents in bedit: per-project profiles, several sessions per project, a chat buffer where every tool is bedit's, or the agent's own terminal UI with bedit's tools added. Claude Code on the subscription first."
   :repository "https://github.com/broodlang/bedit-agent"
-  :enhances {bedit ">= 0.9"}
-  :dependencies [[agentkit :version "^0.1.1"]]
+  :enhances {bedit ">= 0.13"}
+  :dependencies [[agentkit :version "^0.2.0"]]
   :dev-dependencies [[bedit :path "../bedit"]]
   :source-paths ["src"])
